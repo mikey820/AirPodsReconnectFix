@@ -34,8 +34,13 @@ jobs:
       - name: Collect artifacts
         run: |
           mkdir -p artifacts
-          cp rootless/packages/*.deb artifacts/ 2>/dev/null || true
-          cp rootful/packages/*.deb  artifacts/ 2>/dev/null || true
+          # rootless and rootful build to identical filenames, so tag each by scheme.
+          for f in rootless/packages/*.deb; do
+            [ -e "$f" ] && cp "$f" "artifacts/$(basename "${f%.deb}")_rootless.deb"
+          done
+          for f in rootful/packages/*.deb; do
+            [ -e "$f" ] && cp "$f" "artifacts/$(basename "${f%.deb}")_rootful.deb"
+          done
           ls -la artifacts
 
       - name: Upload artifacts
