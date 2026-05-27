@@ -1,0 +1,21 @@
+#!/bin/sh
+# Patch BTServer's launchd plist to force-load our dylib (MobileSubstrate won't
+# inject the daemon on iOS 6). Never abort dpkg on failure — a failed patch just
+# means no daemon injection, which is harmless.
+
+TOOL=/usr/libexec/airpodsreconnectfix/aprfctl
+PL=/System/Library/LaunchDaemons/com.apple.BTServer.plist
+
+if [ -x "$TOOL" ]; then
+    "$TOOL" install || echo "AirPodsReconnectFix: plist patch failed (non-fatal)"
+    chmod 644 "$PL" 2>/dev/null || true
+    chown root:wheel "$PL" 2>/dev/null || true
+fi
+
+echo "==================================================================="
+echo " AirPodsReconnectFix: BTServer.plist patched to load the diagnostic."
+echo " REBOOT the device for it to take effect."
+echo " (Backup at /Library/AirPodsReconnectFix/BTServer.plist.orig;"
+echo "  uninstalling restores it automatically.)"
+echo "==================================================================="
+exit 0

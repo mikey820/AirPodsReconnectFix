@@ -1,0 +1,15 @@
+#!/bin/sh
+# Restore the original BTServer.plist BEFORE our files are removed, so the daemon
+# never points at a deleted dylib (which would break Bluetooth on next boot).
+
+TOOL=/usr/libexec/airpodsreconnectfix/aprfctl
+PL=/System/Library/LaunchDaemons/com.apple.BTServer.plist
+
+if [ -x "$TOOL" ]; then
+    "$TOOL" uninstall || echo "AirPodsReconnectFix: restore FAILED — copy /Library/AirPodsReconnectFix/BTServer.plist.orig over $PL in Filza, then reboot"
+    chmod 644 "$PL" 2>/dev/null || true
+    chown root:wheel "$PL" 2>/dev/null || true
+fi
+
+echo "AirPodsReconnectFix: BTServer.plist restored. Reboot to finish."
+exit 0

@@ -77,7 +77,10 @@ jobs:
           fi
 
       - name: Build
-        run: make clean all
+        run: |
+          # dpkg requires maintainer scripts to be executable.
+          chmod 0755 rootful/layout/DEBIAN/postinst rootful/layout/DEBIAN/prerm
+          make clean all
 
       - name: Collect artifacts
         run: |
