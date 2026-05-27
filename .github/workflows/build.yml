@@ -23,10 +23,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential fakeroot rsync perl git curl unzip xz-utils zstd
 
+      - name: Set THEOS path
+        run: echo "THEOS=$GITHUB_WORKSPACE/theos" >> $GITHUB_ENV
+
+      # Cache the whole Theos tree (toolchain + our prepared armv7 SDK). On a hit
+      # we skip the multi-minute toolchain/SDK download entirely. Bump the key
+      # suffix to force a rebuild of the cache.
+      - name: Cache Theos
+        id: cache-theos
+        uses: actions/cache@v4
+        with:
+          path: theos
+          key: theos-linux-ios6-armv7-sdk-v2
+
       - name: Install Theos (+ Linux toolchain & SDKs)
+        if: steps.cache-theos.outputs.cache-hit != 'true'
         run: |
-          export THEOS=$GITHUB_WORKSPACE/theos
-          echo "THEOS=$THEOS" >> $GITHUB_ENV
           # Official installer: fetches the swift/cctools toolchain and SDKs for Linux.
           export THEOS_NO_PROMPT=1
           bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
@@ -34,6 +46,7 @@ jobs:
           echo "=== SDKs after install ==="; ls "$THEOS/sdks" || true
 
       - name: Add armv7-capable iPhoneOS SDK (<= 10.x for iOS 6 target)
+        if: steps.cache-theos.outputs.cache-hit != 'true'
         run: |
           git clone https://github.com/theos/sdks.git --depth 1 /tmp/sdks
           echo "=== SDKs available in theos/sdks ==="; ls /tmp/sdks
