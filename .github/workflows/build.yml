@@ -11,41 +11,47 @@ permissions:
 
 jobs:
   build:
-    # Older image = older Xcode/toolchain that can still emit 32-bit armv7.
-    runs-on: macos-13
+    # Linux: its cctools/ld64-port linker still supports 32-bit armv7 (Apple's
+    # toolchain dropped it), and there's no macOS runner queue.
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Theos + old armv7 SDK
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential fakeroot rsync perl git curl unzip xz-utils zstd
+
+      - name: Install Theos (+ Linux toolchain & SDKs)
         run: |
           export THEOS=$GITHUB_WORKSPACE/theos
           echo "THEOS=$THEOS" >> $GITHUB_ENV
-          brew install ldid xz
-          git clone --recursive https://github.com/theos/theos.git "$THEOS" --depth 1
+          # Official installer: fetches the swift/cctools toolchain and SDKs for Linux.
+          export THEOS_NO_PROMPT=1
+          bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
+          echo "=== toolchain ==="; ls "$THEOS/toolchain" || true
+          echo "=== SDKs after install ==="; ls "$THEOS/sdks" || true
 
-          # iOS 6 is armv7. We need an SDK that still ships armv7 stubs (i.e.
-          # <= iOS 10.x; iOS 11 SDK dropped 32-bit). Set min deployment to 6.0
-          # at compile time. Pull SDKs and pick the oldest armv7-capable one.
+      - name: Add armv7-capable iPhoneOS SDK (<= 10.x for iOS 6 target)
+        run: |
           git clone https://github.com/theos/sdks.git --depth 1 /tmp/sdks
-          echo "=== SDKs available in theos/sdks ==="
-          ls /tmp/sdks
-          mkdir -p "$THEOS/sdks"
+          echo "=== SDKs available in theos/sdks ==="; ls /tmp/sdks
+          # Remove whatever (newer, arm64-only) SDKs the installer left, so that
+          # Theos's "latest" resolves to the armv7-capable SDK we add below.
+          rm -rf "$THEOS/sdks"/*.sdk
           PICKED=""
-          for v in 6.1 7.1 8.1 8.4 9.0 9.3 10.0 10.3; do
+          for v in 6.1 7.1 8.1 8.4 9.0 9.2 9.3 10.0 10.1 10.2 10.3; do
             if [ -d "/tmp/sdks/iPhoneOS$v.sdk" ]; then
               cp -r "/tmp/sdks/iPhoneOS$v.sdk" "$THEOS/sdks/"
-              PICKED="$v"
-              break
+              PICKED="$v"; break
             fi
           done
           if [ -z "$PICKED" ]; then
-            echo "::error::No armv7-capable iPhoneOS SDK (<=10.3) found in theos/sdks"
-            exit 1
+            echo "::error::No armv7-capable iPhoneOS SDK (<=10.3) found in theos/sdks"; exit 1
           fi
           echo "Using iPhoneOS$PICKED.sdk"
-          echo "=== SDKs now in THEOS ==="
-          ls "$THEOS/sdks"
+          echo "=== SDKs now in THEOS ==="; ls "$THEOS/sdks"
 
       - name: Build
         run: make clean all

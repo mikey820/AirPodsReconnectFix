@@ -1,5 +1,6 @@
-# iOS 6 / 32-bit. iPhone 4S is armv7; iPhone 5/5c are armv7s. Build both.
-ARCHS = armv7 armv7s
+# iOS 6 / 32-bit. armv7 covers every iOS 6 device (the armv7s iPhone 5/5c run
+# armv7 code fine), and avoids depending on armv7s slices being in the old SDK.
+ARCHS = armv7
 # SDK is whatever the CI dropped into $THEOS/sdks (an old armv7-capable SDK);
 # deployment target is iOS 6.0.
 TARGET = iphone:clang:latest:6.0
