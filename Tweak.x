@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <os/log.h>
+#import <sys/stat.h>
 
 // AirPodsReconnectFix
 //
@@ -25,14 +26,42 @@
 //                    re-issue -connect immediately. Debounced + retry-capped so
 //                    the mitigation can never become its own runaway loop.
 //
-// All output goes to os_log subsystem "com.mikey820.airpodsreconnectfix".
-// Pull it from a connected Mac with:
-//   log stream --predicate 'subsystem == "com.mikey820.airpodsreconnectfix"'
-// or save a window:
-//   log collect --device --last 5m   (then open in Console.app and filter)
+// NO MAC NEEDED: everything is written to a plain text file on the device that
+// you can open in Filza (or any file manager):
+//
+//   /var/mobile/Documents/AirPodsReconnectFix.log
+//
+// (Also mirrored to os_log subsystem "com.mikey820.airpodsreconnectfix" for
+// anyone who does have a Mac.) The file is chmod 0666 so both SpringBoard
+// (mobile) and bluetoothd (root) can append to it.
 
 static os_log_t gLog;
-#define AFLog(fmt, ...) os_log(gLog, fmt, ##__VA_ARGS__)
+static dispatch_queue_t gLogQ;
+static NSString *const kLogPath = @"/var/mobile/Documents/AirPodsReconnectFix.log";
+
+__attribute__((format(__NSString__, 1, 2)))
+static void AFLog(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+
+    os_log(gLog, "%{public}s", msg.UTF8String);
+
+    dispatch_async(gLogQ, ^{
+        NSString *line = [NSString stringWithFormat:@"%@ [%@] %@\n",
+                          [NSDate date],
+                          NSProcessInfo.processInfo.processName,
+                          msg];
+        const char *path = kLogPath.fileSystemRepresentation;
+        FILE *f = fopen(path, "a");
+        if (f) {
+            fputs(line.UTF8String, f);
+            fclose(f);
+            chmod(path, 0666);
+        }
+    });
+}
 
 // ---- Mitigation tunables ---------------------------------------------------
 // Auto-reconnect is the only behaviour that changes device state. Everything
@@ -92,27 +121,27 @@ static BOOL underRateLimit(NSString *address) {
 static void handleDisconnect(BluetoothDevice *dev, NSDictionary *userInfo) {
     NSString *name = [dev respondsToSelector:@selector(name)] ? [dev name] : @"?";
     NSString *addr = [dev respondsToSelector:@selector(address)] ? [dev address] : @"?";
-    AFLog("[SpringBoard][disconnect] name=%{public}@ addr=%{public}@ userInfo=%{public}@",
+    AFLog(@"[SpringBoard][disconnect] name=%@ addr=%@ userInfo=%@",
           name, addr, userInfo);
 
     if (!kAutoReconnectEnabled) return;
     if (!deviceLooksLikeAirPods(dev)) {
-        AFLog("[SpringBoard][disconnect] not AirPods, leaving alone");
+        AFLog(@"[SpringBoard][disconnect] not AirPods, leaving alone");
         return;
     }
     if (!underRateLimit(addr ?: name)) {
-        AFLog("[SpringBoard][mitigation] rate limit hit for %{public}@ — backing off", name);
+        AFLog(@"[SpringBoard][mitigation] rate limit hit for %@ — backing off", name);
         return;
     }
-    AFLog("[SpringBoard][mitigation] scheduling reconnect for %{public}@ in %.1fs", name, kReconnectDelaySec);
+    AFLog(@"[SpringBoard][mitigation] scheduling reconnect for %@ in %.1fs", name, kReconnectDelaySec);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kReconnectDelaySec * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if ([dev respondsToSelector:@selector(connected)] && [dev connected]) {
-            AFLog("[SpringBoard][mitigation] %{public}@ already back — no action", name);
+            AFLog(@"[SpringBoard][mitigation] %@ already back — no action", name);
             return;
         }
         if ([dev respondsToSelector:@selector(connect)]) {
-            AFLog("[SpringBoard][mitigation] issuing -connect on %{public}@", name);
+            AFLog(@"[SpringBoard][mitigation] issuing -connect on %@", name);
             [dev connect];
         }
     });
@@ -123,13 +152,13 @@ static void observe(NSString *bareName, NSString *label, void (^block)(NSNotific
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *note) {
-        AFLog("[SpringBoard][event] %{public}@ object=%{public}@", label, note.object);
+        AFLog(@"[SpringBoard][event] %@ object=%@", label, note.object);
         block(note);
     }];
 }
 
 static void setupSpringBoard(void) {
-    AFLog("[SpringBoard] installing BluetoothManager observers (autoReconnect=%{public}s)",
+    AFLog(@"[SpringBoard] installing BluetoothManager observers (autoReconnect=%s)",
           kAutoReconnectEnabled ? "YES" : "NO");
 
     // These notification names are posted by BluetoothManager. We register for
@@ -147,15 +176,15 @@ static void setupSpringBoard(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         Class mgr = objc_getClass("BluetoothManager");
-        if (!mgr) { AFLog("[SpringBoard] BluetoothManager class not found"); return; }
+        if (!mgr) { AFLog(@"[SpringBoard] BluetoothManager class not found"); return; }
         BluetoothManager *m = [mgr sharedInstance];
-        AFLog("[SpringBoard] snapshot connectedDevices=%{public}@", [m connectedDevices]);
+        AFLog(@"[SpringBoard] snapshot connectedDevices=%@", [m connectedDevices]);
     });
 }
 
 // ---- bluetoothd: read-only runtime dump ------------------------------------
 static void dumpBluetoothdRuntime(void) {
-    AFLog("[bluetoothd] runtime dump start");
+    AFLog(@"[bluetoothd] runtime dump start");
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
     int logged = 0;
@@ -172,7 +201,7 @@ static void dumpBluetoothdRuntime(void) {
             [name containsString:@"Accessory"] ||
             [name containsString:@"Device"];
         if (!interesting) continue;
-        AFLog("[bluetoothd][class] %{public}s", cn);
+        AFLog(@"[bluetoothd][class] %s", cn);
         logged++;
         // For the most promising connection-management classes, also dump
         // method names so the next iteration knows what to hook.
@@ -182,24 +211,25 @@ static void dumpBluetoothdRuntime(void) {
             unsigned int mcount = 0;
             Method *methods = class_copyMethodList(classes[i], &mcount);
             for (unsigned int j = 0; j < mcount; j++) {
-                AFLog("[bluetoothd][method] %{public}s -%{public}s",
+                AFLog(@"[bluetoothd][method] %s -%s",
                       cn, sel_getName(method_getName(methods[j])));
             }
             if (methods) free(methods);
         }
     }
     if (classes) free(classes);
-    AFLog("[bluetoothd] runtime dump done (%d interesting of %u classes)", logged, count);
+    AFLog(@"[bluetoothd] runtime dump done (%d interesting of %u classes)", logged, count);
 }
 
 %ctor {
     @autoreleasepool {
         gLog = os_log_create("com.mikey820.airpodsreconnectfix", "tweak");
+        gLogQ = dispatch_queue_create("com.mikey820.airpodsreconnectfix.log", DISPATCH_QUEUE_SERIAL);
         gAttempts = [NSMutableDictionary dictionary];
         gQueue = dispatch_queue_create("com.mikey820.airpodsreconnectfix.q", DISPATCH_QUEUE_SERIAL);
 
         NSString *proc = NSProcessInfo.processInfo.processName;
-        AFLog("[ctor] loaded into process %{public}@", proc);
+        AFLog(@"[ctor] loaded into process %@", proc);
 
         if ([proc isEqualToString:@"bluetoothd"]) {
             dumpBluetoothdRuntime();
