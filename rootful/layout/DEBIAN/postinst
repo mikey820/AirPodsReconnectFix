@@ -5,17 +5,25 @@
 
 TOOL=/usr/libexec/airpodsreconnectfix/aprfctl
 PL=/System/Library/LaunchDaemons/com.apple.BTServer.plist
+LOG=/var/mobile/AirPodsReconnectFix.log
+
+echo "$(date) [postinst] running; remounting / rw and patching" >> "$LOG" 2>/dev/null
+# /System lives on the root partition, which may be mounted read-only at runtime.
+/sbin/mount -u -o rw / 2>/dev/null || mount -u -o rw / 2>/dev/null || true
 
 if [ -x "$TOOL" ]; then
-    "$TOOL" install || echo "AirPodsReconnectFix: plist patch failed (non-fatal)"
+    "$TOOL" install || echo "$(date) [postinst] aprfctl install returned $?" >> "$LOG" 2>/dev/null
     chmod 644 "$PL" 2>/dev/null || true
     chown root:wheel "$PL" 2>/dev/null || true
+else
+    echo "$(date) [postinst] tool missing at $TOOL" >> "$LOG" 2>/dev/null
 fi
 
 echo "==================================================================="
-echo " AirPodsReconnectFix: BTServer.plist patched to load the diagnostic."
+echo " AirPodsReconnectFix: BTServer.plist patch attempted."
 echo " REBOOT the device for it to take effect."
 echo " (Backup at /Library/AirPodsReconnectFix/BTServer.plist.orig;"
-echo "  uninstalling restores it automatically.)"
+echo "  uninstalling restores it automatically. Check the log at"
+echo "  /var/mobile/AirPodsReconnectFix.log for the patch result.)"
 echo "==================================================================="
 exit 0
