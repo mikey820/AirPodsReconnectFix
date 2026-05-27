@@ -120,42 +120,32 @@ static BOOL deviceLooksLikeAirPods(BluetoothDevice *dev) {
     return strHas([dev name], @"airpod");
 }
 
-// The AirPods device we're currently tracking, for keep-alive. Strong ref under
-// ARC; refreshed whenever we see the device in a notification.
-static BluetoothDevice *gAirPods;
-static BOOL gKeepAliveRunning;
-
 // Generate a little link traffic to (hopefully) reset an idle/sniff timeout.
+//
+// CRITICAL: never retain a BluetoothDevice across time. The wrapper holds a raw
+// pointer to a daemon-side device struct; retaining the ObjC object does NOT
+// keep that struct alive, so poking a stale device later is a dangling-pointer
+// crash (SIGSEGV — uncatchable by @try, this is what was crashing SpringBoard).
+// So we re-fetch the live connectedDevices fresh on every single tick.
 static void keepAliveTick(void) {
     @try {
-        BluetoothDevice *d = gAirPods;
-        BOOL connected = d && [d respondsToSelector:@selector(connected)] && [d connected];
-        if (connected) {
-            if ([d respondsToSelector:@selector(batteryLevel)])      (void)[d batteryLevel];
-            if ([d respondsToSelector:@selector(connectedServices)]) (void)[d connectedServices];
-            AFLog(@"[SpringBoard][keepalive] poked %@ (connected, batt=%d)",
-                  [d respondsToSelector:@selector(name)] ? [d name] : @"?",
-                  [d respondsToSelector:@selector(batteryLevel)] ? [d batteryLevel] : -1);
-        } else {
-            AFLog(@"[SpringBoard][keepalive] skip (no connected AirPods tracked)");
+        Class mgrC = objc_getClass("BluetoothManager");
+        BluetoothManager *m = mgrC ? [mgrC sharedInstance] : nil;
+        NSArray *devs = [m respondsToSelector:@selector(connectedDevices)] ? [m connectedDevices] : nil;
+        BOOL poked = NO;
+        for (BluetoothDevice *d in devs) {
+            if (!deviceLooksLikeAirPods(d)) continue;
+            if (![d respondsToSelector:@selector(connected)] || ![d connected]) continue;
+            int batt = [d respondsToSelector:@selector(batteryLevel)] ? [d batteryLevel] : -1;
+            AFLog(@"[SpringBoard][keepalive] poked %@ (batt=%d)", [d name], batt);
+            poked = YES;
         }
+        if (!poked) AFLog(@"[SpringBoard][keepalive] skip (no connected AirPods right now)");
     } @catch (NSException *e) {
         AFLog(@"[SpringBoard][keepalive][EXC] %@ %@", e.name, e.reason);
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kKeepAliveSec * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ keepAliveTick(); });
-}
-
-// Remember an AirPods device when we see it, and kick off the keep-alive loop once.
-static void trackAirPods(BluetoothDevice *dev) {
-    if (!deviceLooksLikeAirPods(dev)) return;
-    gAirPods = dev;
-    if (kKeepAliveEnabled && !gKeepAliveRunning) {
-        gKeepAliveRunning = YES;
-        AFLog(@"[SpringBoard][keepalive] starting, every %.0fs", kKeepAliveSec);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kKeepAliveSec * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ keepAliveTick(); });
-    }
 }
 
 // address -> NSMutableArray<NSDate*> of recent reconnect attempts.
@@ -235,7 +225,6 @@ static void observe(NSString *bareName, NSString *label, void (^block)(NSNotific
         @try {
             AFLog(@"[SpringBoard][event] %@ object=%@", label, note.object);
             dumpDeviceOnce(note.object);
-            trackAirPods((BluetoothDevice *)note.object);
             block(note);
         } @catch (NSException *e) {
             // Never let our handler take SpringBoard down — just log and move on.
@@ -277,6 +266,15 @@ static void setupSpringBoard(void) {
     observe(@"BluetoothDeviceUpdatedNotification", @"device-updated", ^(NSNotification *n) {});
     observe(@"BluetoothConnectabilityChangedNotification", @"connectability", ^(NSNotification *n) {});
     observe(@"BluetoothAvailabilityChangedNotification", @"availability", ^(NSNotification *n) {});
+
+    // Start the keep-alive loop once. It self-reschedules and re-fetches the
+    // live connected device on every tick, so it's safe whether or not anything
+    // is connected yet.
+    if (kKeepAliveEnabled) {
+        AFLog(@"[SpringBoard][keepalive] starting, every %.0fs", kKeepAliveSec);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kKeepAliveSec * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ keepAliveTick(); });
+    }
 
     // One-shot snapshot of what's currently connected, for context in the logs.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
