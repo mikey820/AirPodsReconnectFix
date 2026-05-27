@@ -1,1 +1,1 @@
-{ Filter = { Bundles = ( "com.apple.springboard" ); Executables = ( "BTServer", "bluetoothd" ); }; }
+{ Filter = { Bundles = ( "com.apple.springboard" ); Executables = ( "BTServer", "BTServerAVRCP", "BTServerMap", "BlueTool", "bluetoothd" ); }; }

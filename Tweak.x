@@ -163,6 +163,19 @@ static void handleDisconnect(BluetoothDevice *dev, NSDictionary *userInfo) {
     });
 }
 
+static void dumpClassMethods(Class cls, const char *why);  // defined below
+
+// Dump the concrete BluetoothDevice class the first time we actually hold one
+// (the 3s startup snapshot can race ahead of any device existing). One shot.
+static void dumpDeviceOnce(id obj) {
+    static BOOL done = NO;
+    if (done || !obj) return;
+    if (![obj respondsToSelector:@selector(name)] &&
+        ![obj respondsToSelector:@selector(address)]) return;  // not a device
+    done = YES;
+    dumpClassMethods(object_getClass(obj), "BluetoothDevice");
+}
+
 static void observe(NSString *bareName, NSString *label, void (^block)(NSNotification *)) {
     [[NSNotificationCenter defaultCenter] addObserverForName:bareName
                                                       object:nil
@@ -170,6 +183,7 @@ static void observe(NSString *bareName, NSString *label, void (^block)(NSNotific
                                                   usingBlock:^(NSNotification *note) {
         @try {
             AFLog(@"[SpringBoard][event] %@ object=%@", label, note.object);
+            dumpDeviceOnce(note.object);
             block(note);
         } @catch (NSException *e) {
             // Never let our handler take SpringBoard down — just log and move on.
@@ -285,13 +299,16 @@ static void dumpBluetoothdRuntime(void) {
         NSString *proc = NSProcessInfo.processInfo.processName;
         AFLog(@"[ctor] loaded into process %@", proc);
 
-        // iOS 6's Bluetooth daemon is BTServer; bluetoothd is the later name.
-        // Match both so the runtime dump runs wherever the BT stack lives.
+        // iOS 6's BT stack is BTServer (+ helper daemons BTServerAVRCP /
+        // BTServerMap / BlueTool); bluetoothd is the later name. Run the runtime
+        // dump in any of them so we capture wherever the link control lives.
         @try {
-            if ([proc isEqualToString:@"BTServer"] || [proc isEqualToString:@"bluetoothd"]) {
-                dumpBluetoothdRuntime();
-            } else if ([proc isEqualToString:@"SpringBoard"]) {
+            if ([proc isEqualToString:@"SpringBoard"]) {
                 setupSpringBoard();
+            } else {
+                // Any non-SpringBoard process we were injected into is a BT
+                // daemon (per the filter) — dump its runtime.
+                dumpBluetoothdRuntime();
             }
         } @catch (NSException *e) {
             // Critically, never crash the BT daemon or SpringBoard at load.
