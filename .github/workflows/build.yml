@@ -21,7 +21,7 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential fakeroot rsync perl git curl unzip xz-utils zstd dpkg-dev bzip2
+          sudo apt-get install -y build-essential fakeroot rsync perl git curl unzip xz-utils zstd
 
       - name: Install Theos (+ Linux toolchain & SDKs)
         run: |
@@ -86,34 +86,3 @@ jobs:
         with:
           files: artifacts/*
           generate_release_notes: true
-
-      - name: Prepare Cydia repo
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-        run: |
-          mkdir -p cydia-repo
-          git fetch origin gh-pages 2>/dev/null && git --work-tree=cydia-repo checkout origin/gh-pages -- . 2>/dev/null || true
-          mkdir -p cydia-repo/debs
-          cp artifacts/*.deb cydia-repo/debs/
-          cp icon.png cydia-repo/CydiaIcon.png 2>/dev/null || true
-          cd cydia-repo
-          dpkg-scanpackages -m debs /dev/null > Packages
-          bzip2 -kf Packages
-          cat > Release << 'EOF'
-          Origin: mikey820
-          Label: AirPodsReconnectFix
-          Suite: stable
-          Version: 1.0
-          Codename: ios
-          Architectures: iphoneos-arm
-          Components: main
-          Description: AirPods Bluetooth disconnect/reconnect loop fix for iOS 6
-          EOF
-          echo "=== Cydia repo contents ==="
-          ls -laR
-
-      - name: Deploy to GitHub Pages
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./cydia-repo
