@@ -87,6 +87,17 @@ static const double kReconnectDelaySec = 1.5;
 static const int    kMaxAttempts = 4;
 static const double kWindowSec   = 60.0;
 
+// ---- Keep-alive ------------------------------------------------------------
+// The drop is a dead-regular ~47s cycle. If that's an idle / power-save (sniff)
+// timeout, generating a little link traffic before it fires should reset the
+// timer and stop the disconnect. We can't touch the link layer from here, but
+// reading battery / service state over BluetoothManager does round-trip the
+// device, which may be enough to keep the link "warm". Fires comfortably inside
+// the ~47s window. (If the drop happens even with this running, it's a true
+// link-layer failure that needs daemon access — not an idle timeout.)
+static const BOOL   kKeepAliveEnabled = YES;
+static const double kKeepAliveSec     = 25.0;
+
 // ---- BluetoothManager.framework (private, stable across iOS versions) ------
 @interface BluetoothDevice : NSObject
 - (NSString *)name;
@@ -94,6 +105,8 @@ static const double kWindowSec   = 60.0;
 - (BOOL)connected;
 - (void)connect;
 - (void)disconnect;
+- (int)batteryLevel;
+- (NSArray *)connectedServices;
 @end
 
 @interface BluetoothManager : NSObject
@@ -105,6 +118,44 @@ static const double kWindowSec   = 60.0;
 static BOOL deviceLooksLikeAirPods(BluetoothDevice *dev) {
     if (![dev respondsToSelector:@selector(name)]) return NO;
     return strHas([dev name], @"airpod");
+}
+
+// The AirPods device we're currently tracking, for keep-alive. Strong ref under
+// ARC; refreshed whenever we see the device in a notification.
+static BluetoothDevice *gAirPods;
+static BOOL gKeepAliveRunning;
+
+// Generate a little link traffic to (hopefully) reset an idle/sniff timeout.
+static void keepAliveTick(void) {
+    @try {
+        BluetoothDevice *d = gAirPods;
+        BOOL connected = d && [d respondsToSelector:@selector(connected)] && [d connected];
+        if (connected) {
+            if ([d respondsToSelector:@selector(batteryLevel)])      (void)[d batteryLevel];
+            if ([d respondsToSelector:@selector(connectedServices)]) (void)[d connectedServices];
+            AFLog(@"[SpringBoard][keepalive] poked %@ (connected, batt=%d)",
+                  [d respondsToSelector:@selector(name)] ? [d name] : @"?",
+                  [d respondsToSelector:@selector(batteryLevel)] ? [d batteryLevel] : -1);
+        } else {
+            AFLog(@"[SpringBoard][keepalive] skip (no connected AirPods tracked)");
+        }
+    } @catch (NSException *e) {
+        AFLog(@"[SpringBoard][keepalive][EXC] %@ %@", e.name, e.reason);
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kKeepAliveSec * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ keepAliveTick(); });
+}
+
+// Remember an AirPods device when we see it, and kick off the keep-alive loop once.
+static void trackAirPods(BluetoothDevice *dev) {
+    if (!deviceLooksLikeAirPods(dev)) return;
+    gAirPods = dev;
+    if (kKeepAliveEnabled && !gKeepAliveRunning) {
+        gKeepAliveRunning = YES;
+        AFLog(@"[SpringBoard][keepalive] starting, every %.0fs", kKeepAliveSec);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kKeepAliveSec * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ keepAliveTick(); });
+    }
 }
 
 // address -> NSMutableArray<NSDate*> of recent reconnect attempts.
@@ -184,6 +235,7 @@ static void observe(NSString *bareName, NSString *label, void (^block)(NSNotific
         @try {
             AFLog(@"[SpringBoard][event] %@ object=%@", label, note.object);
             dumpDeviceOnce(note.object);
+            trackAirPods((BluetoothDevice *)note.object);
             block(note);
         } @catch (NSException *e) {
             // Never let our handler take SpringBoard down — just log and move on.
