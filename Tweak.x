@@ -31,13 +31,26 @@
 // written to a plain text file on the device that you can open in Filza (or any
 // file manager):
 //
-//   /var/mobile/Documents/AirPodsReconnectFix.log
+//   /var/mobile/AirPodsReconnectFix.log
+//
+// (/var/mobile/Documents doesn't exist on this jailbreak, so we write straight
+// to /var/mobile, which always exists and mobile can write to.)
 //
 // The file is chmod 0666 so both SpringBoard (mobile) and bluetoothd (root) can
 // append to it. We also NSLog for good measure.
 
 static dispatch_queue_t gLogQ;
-static NSString *const kLogPath = @"/var/mobile/Documents/AirPodsReconnectFix.log";
+static NSString *const kLogPath = @"/var/mobile/AirPodsReconnectFix.log";
+
+// iOS 6-safe case-insensitive substring test. NSString -containsString: and
+// -localizedCaseInsensitiveContainsString: are iOS 8+ ONLY — calling them on
+// iOS 6 is an unrecognized selector that crashes the host process (this is what
+// was respringing SpringBoard on every disconnect). -rangeOfString:options:
+// has existed since iPhoneOS 2.0.
+static BOOL strHas(NSString *haystack, NSString *needle) {
+    if (![haystack isKindOfClass:[NSString class]] || needle.length == 0) return NO;
+    return [haystack rangeOfString:needle options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
 
 __attribute__((format(__NSString__, 1, 2)))
 static void AFLog(NSString *fmt, ...) {
@@ -91,8 +104,7 @@ static const double kWindowSec   = 60.0;
 
 static BOOL deviceLooksLikeAirPods(BluetoothDevice *dev) {
     if (![dev respondsToSelector:@selector(name)]) return NO;
-    NSString *n = [dev name];
-    return n.length && [n localizedCaseInsensitiveContainsString:@"airpod"];
+    return strHas([dev name], @"airpod");
 }
 
 // address -> NSMutableArray<NSDate*> of recent reconnect attempts.
@@ -136,13 +148,17 @@ static void handleDisconnect(BluetoothDevice *dev, NSDictionary *userInfo) {
     AFLog(@"[SpringBoard][mitigation] scheduling reconnect for %@ in %.1fs", name, kReconnectDelaySec);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kReconnectDelaySec * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        if ([dev respondsToSelector:@selector(connected)] && [dev connected]) {
-            AFLog(@"[SpringBoard][mitigation] %@ already back — no action", name);
-            return;
-        }
-        if ([dev respondsToSelector:@selector(connect)]) {
-            AFLog(@"[SpringBoard][mitigation] issuing -connect on %@", name);
-            [dev connect];
+        @try {
+            if ([dev respondsToSelector:@selector(connected)] && [dev connected]) {
+                AFLog(@"[SpringBoard][mitigation] %@ already back — no action", name);
+                return;
+            }
+            if ([dev respondsToSelector:@selector(connect)]) {
+                AFLog(@"[SpringBoard][mitigation] issuing -connect on %@", name);
+                [dev connect];
+            }
+        } @catch (NSException *e) {
+            AFLog(@"[SpringBoard][EXC] reconnect %@: %@ %@", name, e.name, e.reason);
         }
     });
 }
@@ -152,8 +168,14 @@ static void observe(NSString *bareName, NSString *label, void (^block)(NSNotific
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *note) {
-        AFLog(@"[SpringBoard][event] %@ object=%@", label, note.object);
-        block(note);
+        @try {
+            AFLog(@"[SpringBoard][event] %@ object=%@", label, note.object);
+            block(note);
+        } @catch (NSException *e) {
+            // Never let our handler take SpringBoard down — just log and move on.
+            AFLog(@"[SpringBoard][EXC] %@ in %@ handler: %@ %@",
+                  e.name, label, e.reason, e.userInfo);
+        }
     }];
 }
 
@@ -193,21 +215,21 @@ static void dumpBluetoothdRuntime(void) {
         if (!cn) continue;
         NSString *name = @(cn);
         BOOL interesting =
-            [name containsString:@"Bluetooth"] ||
+            strHas(name, @"Bluetooth") ||
             [name hasPrefix:@"BT"] ||
-            [name containsString:@"Audio"] ||
-            [name containsString:@"Connection"] ||
-            [name containsString:@"Link"] ||
-            [name containsString:@"Accessory"] ||
-            [name containsString:@"Device"];
+            strHas(name, @"Audio") ||
+            strHas(name, @"Connection") ||
+            strHas(name, @"Link") ||
+            strHas(name, @"Accessory") ||
+            strHas(name, @"Device");
         if (!interesting) continue;
         AFLog(@"[bluetoothd][class] %s", cn);
         logged++;
         // For the most promising connection-management classes, also dump
         // method names so the next iteration knows what to hook.
-        if ([name containsString:@"Connection"] ||
-            [name containsString:@"Link"] ||
-            [name containsString:@"Device"]) {
+        if (strHas(name, @"Connection") ||
+            strHas(name, @"Link") ||
+            strHas(name, @"Device")) {
             unsigned int mcount = 0;
             Method *methods = class_copyMethodList(classes[i], &mcount);
             for (unsigned int j = 0; j < mcount; j++) {
@@ -232,10 +254,15 @@ static void dumpBluetoothdRuntime(void) {
 
         // iOS 6's Bluetooth daemon is BTServer; bluetoothd is the later name.
         // Match both so the runtime dump runs wherever the BT stack lives.
-        if ([proc isEqualToString:@"BTServer"] || [proc isEqualToString:@"bluetoothd"]) {
-            dumpBluetoothdRuntime();
-        } else if ([proc isEqualToString:@"SpringBoard"]) {
-            setupSpringBoard();
+        @try {
+            if ([proc isEqualToString:@"BTServer"] || [proc isEqualToString:@"bluetoothd"]) {
+                dumpBluetoothdRuntime();
+            } else if ([proc isEqualToString:@"SpringBoard"]) {
+                setupSpringBoard();
+            }
+        } @catch (NSException *e) {
+            // Critically, never crash the BT daemon or SpringBoard at load.
+            AFLog(@"[ctor][EXC] %@ in %@: %@", e.name, proc, e.reason);
         }
     }
 }
