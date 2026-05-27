@@ -230,9 +230,11 @@ static void dumpBluetoothdRuntime(void) {
         NSString *proc = NSProcessInfo.processInfo.processName;
         AFLog(@"[ctor] loaded into process %@", proc);
 
-        if ([proc isEqualToString:@"bluetoothd"]) {
+        // iOS 6's Bluetooth daemon is BTServer; bluetoothd is the later name.
+        // Match both so the runtime dump runs wherever the BT stack lives.
+        if ([proc isEqualToString:@"BTServer"] || [proc isEqualToString:@"bluetoothd"]) {
             dumpBluetoothdRuntime();
-        } else {
+        } else if ([proc isEqualToString:@"SpringBoard"]) {
             setupSpringBoard();
         }
     }

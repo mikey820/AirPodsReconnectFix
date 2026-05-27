@@ -1,6 +1,6 @@
 Package: com.mikey820.airpodsreconnectfix
 Name: AirPodsReconnectFix
-Version: 2.0.0
+Version: 2.1.0
 Architecture: iphoneos-arm
 Description: Diagnose & mitigate the AirPods Bluetooth disconnect/reconnect loop on iOS 6
 Maintainer: mikey820 <mikey820@users.noreply.github.com>
