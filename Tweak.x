@@ -179,6 +179,24 @@ static void observe(NSString *bareName, NSString *label, void (^block)(NSNotific
     }];
 }
 
+// Dump every method of a class (incl. its metaclass) so we can spot link-control
+// entry points — supervision timeout, low-power/sniff mode, role, keep-alive —
+// that we could call to stop the periodic teardown. Read-only.
+static void dumpClassMethods(Class cls, const char *why) {
+    if (!cls) { AFLog(@"[SpringBoard][dump] %s: class is nil", why); return; }
+    AFLog(@"[SpringBoard][dump] %s class=%s ----", why, class_getName(cls));
+    for (int meta = 0; meta < 2; meta++) {
+        Class c = meta ? object_getClass((id)cls) : cls;  // metaclass = +methods
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(c, &mc);
+        for (unsigned int j = 0; j < mc; j++) {
+            AFLog(@"[SpringBoard][dump] %s %c%s", class_getName(cls),
+                  meta ? '+' : '-', sel_getName(method_getName(ms[j])));
+        }
+        if (ms) free(ms);
+    }
+}
+
 static void setupSpringBoard(void) {
     AFLog(@"[SpringBoard] installing BluetoothManager observers (autoReconnect=%s)",
           kAutoReconnectEnabled ? "YES" : "NO");
@@ -201,6 +219,21 @@ static void setupSpringBoard(void) {
         if (!mgr) { AFLog(@"[SpringBoard] BluetoothManager class not found"); return; }
         BluetoothManager *m = [mgr sharedInstance];
         AFLog(@"[SpringBoard] snapshot connectedDevices=%@", [m connectedDevices]);
+
+        // One-time surface dump. The daemon-side classes only load into BTServer
+        // (needs a reboot to inject), but BluetoothManager/BluetoothDevice live
+        // here in SpringBoard, so dump what we can reach right now.
+        dumpClassMethods(mgr, "BluetoothManager");
+        NSArray *known = [m respondsToSelector:@selector(devices)] ? [m devices]
+                       : [m respondsToSelector:@selector(connectedDevices)] ? [m connectedDevices]
+                       : nil;
+        AFLog(@"[SpringBoard] known devices count=%u", (unsigned)known.count);
+        if (known.count) {
+            // They share a class; dumping one concrete BluetoothDevice is enough.
+            dumpClassMethods(object_getClass(known[0]), "BluetoothDevice");
+        } else {
+            AFLog(@"[SpringBoard] no devices to dump class from — reconnect AirPods then re-grab log");
+        }
     });
 }
 
