@@ -11,42 +11,57 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-latest
+    # Older image = older Xcode/toolchain that can still emit 32-bit armv7.
+    runs-on: macos-13
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Theos
+      - name: Setup Theos + old armv7 SDK
         run: |
-          export THEOS=${{ github.workspace }}/theos
+          export THEOS=$GITHUB_WORKSPACE/theos
           echo "THEOS=$THEOS" >> $GITHUB_ENV
-          brew install ldid
-          git clone --recursive https://github.com/theos/theos.git $THEOS --depth 1
-          SDK_VER=$(xcrun --sdk iphoneos --show-sdk-version)
-          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          mkdir -p "$THEOS/sdks"
-          ln -s "$SDK_PATH" "$THEOS/sdks/iPhoneOS${SDK_VER}.sdk"
-          echo "SDK setup complete: iPhoneOS${SDK_VER}.sdk"
+          brew install ldid xz
+          git clone --recursive https://github.com/theos/theos.git "$THEOS" --depth 1
 
-      - name: Build all variants
+          # iOS 6 is armv7. We need an SDK that still ships armv7 stubs (i.e.
+          # <= iOS 10.x; iOS 11 SDK dropped 32-bit). Set min deployment to 6.0
+          # at compile time. Pull SDKs and pick the oldest armv7-capable one.
+          git clone https://github.com/theos/sdks.git --depth 1 /tmp/sdks
+          echo "=== SDKs available in theos/sdks ==="
+          ls /tmp/sdks
+          mkdir -p "$THEOS/sdks"
+          PICKED=""
+          for v in 6.1 7.1 8.1 8.4 9.0 9.3 10.0 10.3; do
+            if [ -d "/tmp/sdks/iPhoneOS$v.sdk" ]; then
+              cp -r "/tmp/sdks/iPhoneOS$v.sdk" "$THEOS/sdks/"
+              PICKED="$v"
+              break
+            fi
+          done
+          if [ -z "$PICKED" ]; then
+            echo "::error::No armv7-capable iPhoneOS SDK (<=10.3) found in theos/sdks"
+            exit 1
+          fi
+          echo "Using iPhoneOS$PICKED.sdk"
+          echo "=== SDKs now in THEOS ==="
+          ls "$THEOS/sdks"
+
+      - name: Build
         run: make clean all
 
       - name: Collect artifacts
         run: |
           mkdir -p artifacts
-          # rootless and rootful build to identical filenames, so tag each by scheme.
-          for f in rootless/packages/*.deb; do
-            [ -e "$f" ] && cp "$f" "artifacts/$(basename "${f%.deb}")_rootless.deb"
-          done
           for f in rootful/packages/*.deb; do
-            [ -e "$f" ] && cp "$f" "artifacts/$(basename "${f%.deb}")_rootful.deb"
+            [ -e "$f" ] && cp "$f" artifacts/
           done
           ls -la artifacts
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: AirPodsReconnectFix-all
+          name: AirPodsReconnectFix
           path: artifacts/*
 
       - name: Release

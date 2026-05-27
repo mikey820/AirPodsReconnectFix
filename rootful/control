@@ -1,10 +1,10 @@
 Package: com.mikey820.airpodsreconnectfix
 Name: AirPodsReconnectFix
-Version: 1.0.0
-Architecture: iphoneos-arm64
-Description: Diagnose & mitigate the AirPods Pro disconnect/reconnect loop on iOS 16
+Version: 2.0.0
+Architecture: iphoneos-arm
+Description: Diagnose & mitigate the AirPods Bluetooth disconnect/reconnect loop on iOS 6
 Maintainer: mikey820 <mikey820@users.noreply.github.com>
 Author: mikey820
 Section: Tweaks
 Icon: icon.png
-Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 14.0)
+Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 6.0)

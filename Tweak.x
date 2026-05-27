@@ -1,16 +1,17 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
-#import <os/log.h>
 #import <sys/stat.h>
 
-// AirPodsReconnectFix
+// AirPodsReconnectFix  (iOS 6 / armv7)
 //
-// Problem (reported on iOS 16 + AirPods Pro 2/3 after the post-APP3 firmware):
-// the AirPods pair fine, then disconnect/reconnect every few seconds. Audio is
-// great while it holds, but the link never stays up. The likely root cause is
-// down in bluetoothd's LE connection-parameter / supervision-timeout
-// negotiation — something the newer AirPods firmware now advertises that the
-// older iOS 16 stack mishandles, tearing the link down.
+// Problem (AirPods Pro 2/3 paired to an iOS 6 device as a generic A2DP/HFP
+// Bluetooth headset): they pair fine via Settings, audio is great while it
+// holds, but after the post-AirPods-Pro-3 firmware update the link drops and
+// re-establishes every few seconds. The likely cause is that the new AirPods
+// firmware changed something at the Bluetooth link layer (connection params /
+// supervision timeout / link policy) that the ancient iOS 6 stack mishandles,
+// tearing the link down. iOS 6 has none of the W1/AAP machinery — to it these
+// are just a stereo headset.
 //
 // We cannot safely rewrite that negotiation blind from a tweak (crashing
 // bluetoothd in a loop would take Bluetooth down system-wide). So this build is
@@ -26,16 +27,15 @@
 //                    re-issue -connect immediately. Debounced + retry-capped so
 //                    the mitigation can never become its own runaway loop.
 //
-// NO MAC NEEDED: everything is written to a plain text file on the device that
-// you can open in Filza (or any file manager):
+// NO MAC NEEDED (and os_log doesn't exist on iOS 6 anyway): everything is
+// written to a plain text file on the device that you can open in Filza (or any
+// file manager):
 //
 //   /var/mobile/Documents/AirPodsReconnectFix.log
 //
-// (Also mirrored to os_log subsystem "com.mikey820.airpodsreconnectfix" for
-// anyone who does have a Mac.) The file is chmod 0666 so both SpringBoard
-// (mobile) and bluetoothd (root) can append to it.
+// The file is chmod 0666 so both SpringBoard (mobile) and bluetoothd (root) can
+// append to it. We also NSLog for good measure.
 
-static os_log_t gLog;
 static dispatch_queue_t gLogQ;
 static NSString *const kLogPath = @"/var/mobile/Documents/AirPodsReconnectFix.log";
 
@@ -46,7 +46,7 @@ static void AFLog(NSString *fmt, ...) {
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
 
-    os_log(gLog, "%{public}s", msg.UTF8String);
+    NSLog(@"[AirPodsReconnectFix] %@", msg);
 
     dispatch_async(gLogQ, ^{
         NSString *line = [NSString stringWithFormat:@"%@ [%@] %@\n",
@@ -223,7 +223,6 @@ static void dumpBluetoothdRuntime(void) {
 
 %ctor {
     @autoreleasepool {
-        gLog = os_log_create("com.mikey820.airpodsreconnectfix", "tweak");
         gLogQ = dispatch_queue_create("com.mikey820.airpodsreconnectfix.log", DISPATCH_QUEUE_SERIAL);
         gAttempts = [NSMutableDictionary dictionary];
         gQueue = dispatch_queue_create("com.mikey820.airpodsreconnectfix.q", DISPATCH_QUEUE_SERIAL);
