@@ -1,0 +1,4 @@
+# Force LF for everything the macOS CI runner / Theos build touches.
+* text=auto eol=lf
+*.png binary
+icon.png binary
