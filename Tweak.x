@@ -101,10 +101,25 @@ static const double kWindowSec   = 60.0;
 static const BOOL   kKeepAliveEnabled = NO;
 static const double kKeepAliveSec     = 25.0;
 
-// Bounce the audio route automatically a couple seconds after the AirPods
-// connect (when audio is most likely to come up stalled). Debounced.
-static const BOOL   kBounceOnConnect  = YES;
+// Bounce the audio route automatically a couple seconds after AirPods connect.
+// DISABLED: confirmed on-device that the speaker leg of the bounce pauses the
+// active music session and it doesn't auto-resume — net effect is worse than
+// no fix. The manual Darwin trigger (notifyutil -p ...bounce) still works
+// for the audio-cut-without-disconnect symptom where the user is willing to
+// trigger it explicitly.
+static const BOOL   kBounceOnConnect  = NO;
 static const double kBounceOnConnectDelaySec = 2.0;
+
+// After auto-reconnect, automatically resume music playback if it was playing
+// before the drop. This is the real disconnect-mitigation deliverable: the
+// drop still happens (we can't stop it — BTServer is unreachable on this
+// jailbreak), but to the user it looks like "music briefly stops and comes
+// back on its own" instead of "music dies and I have to manually tap play".
+static const BOOL   kAutoResumePlayback        = YES;
+static const double kResumePlaybackDelaySec    = 2.0;  // give A2DP route a beat
+// Don't try to resume if the drop happened too long ago — user probably moved
+// on. Anything beyond ~30s, assume they don't want surprise audio.
+static const double kResumeMaxStaleSec         = 30.0;
 
 // ---- BluetoothManager.framework (private, stable across iOS versions) ------
 @interface BluetoothDevice : NSObject
@@ -126,6 +141,70 @@ static const double kBounceOnConnectDelaySec = 2.0;
 static BOOL deviceLooksLikeAirPods(BluetoothDevice *dev) {
     if (![dev respondsToSelector:@selector(name)]) return NO;
     return strHas([dev name], @"airpod");
+}
+
+// ---- SpringBoard media controller (resume music after auto-reconnect) ------
+@interface SBMediaController : NSObject
++ (instancetype)sharedInstance;
+- (BOOL)isPlaying;
+- (BOOL)isRingerMuted;
+- (BOOL)play;
+- (BOOL)pause;
+- (BOOL)togglePlayPause;
+- (id)nowPlayingApplication;
+@end
+
+// True if music was playing the last time AirPods dropped (so we know whether
+// to resume after the auto-reconnect succeeds). Reset to NO when we resume,
+// when the drop becomes stale, or when no music was playing at drop time.
+static BOOL    gWasPlayingAtLastDrop = NO;
+static NSDate *gLastDropAt = nil;
+
+static void rememberPlaybackStateOnDrop(NSString *why) {
+    if (!kAutoResumePlayback) return;
+    @try {
+        Class C = objc_getClass("SBMediaController");
+        if (!C) { AFLog(@"[resume] SBMediaController missing (%@)", why); return; }
+        id mc = [C sharedInstance];
+        BOOL playing = [mc respondsToSelector:@selector(isPlaying)] && [mc isPlaying];
+        gWasPlayingAtLastDrop = playing;
+        gLastDropAt = [NSDate date];
+        AFLog(@"[resume] remembered isPlaying=%d (%@)", playing, why);
+    } @catch (NSException *e) {
+        AFLog(@"[resume][EXC remember] %@ %@", e.name, e.reason);
+    }
+}
+
+static void tryResumePlayback(NSString *why) {
+    if (!kAutoResumePlayback) return;
+    @try {
+        if (!gWasPlayingAtLastDrop) {
+            AFLog(@"[resume] nothing was playing at last drop — skip (%@)", why);
+            return;
+        }
+        if (!gLastDropAt ||
+            [[NSDate date] timeIntervalSinceDate:gLastDropAt] > kResumeMaxStaleSec) {
+            AFLog(@"[resume] last drop too stale — skip (%@)", why);
+            gWasPlayingAtLastDrop = NO;
+            return;
+        }
+        Class C = objc_getClass("SBMediaController");
+        if (!C) { AFLog(@"[resume] SBMediaController missing (%@)", why); return; }
+        id mc = [C sharedInstance];
+        if (![mc respondsToSelector:@selector(play)]) {
+            AFLog(@"[resume] no -play selector"); return;
+        }
+        if ([mc respondsToSelector:@selector(isPlaying)] && [mc isPlaying]) {
+            AFLog(@"[resume] already playing — clear flag (%@)", why);
+            gWasPlayingAtLastDrop = NO;
+            return;
+        }
+        AFLog(@"[resume] issuing -play (%@)", why);
+        [mc play];
+        gWasPlayingAtLastDrop = NO;
+    } @catch (NSException *e) {
+        AFLog(@"[resume][EXC try] %@ %@", e.name, e.reason);
+    }
 }
 
 // ---- Audio-route bounce (THE actual fix) -----------------------------------
@@ -399,6 +478,10 @@ static void handleDisconnect(BluetoothDevice *dev, NSDictionary *userInfo) {
         AFLog(@"[SpringBoard][disconnect] not AirPods, leaving alone");
         return;
     }
+    // Capture whether music was playing BEFORE we wait — iOS may auto-pause the
+    // session as soon as the A2DP route goes away, so we want the state from
+    // before that happens (this handler fires very fast after the drop).
+    rememberPlaybackStateOnDrop([NSString stringWithFormat:@"AirPods drop: %@", name]);
     if (!underRateLimit(addr ?: name)) {
         AFLog(@"[SpringBoard][mitigation] rate limit hit for %@ — backing off", name);
         return;
@@ -488,9 +571,16 @@ static void setupSpringBoard(void) {
         handleDisconnect((BluetoothDevice *)n.object, n.userInfo);
     });
     observe(@"BluetoothDeviceConnectSuccessNotification", @"connect", ^(NSNotification *n) {
-        if (kBounceOnConnect && deviceLooksLikeAirPods((BluetoothDevice *)n.object)) {
+        if (!deviceLooksLikeAirPods((BluetoothDevice *)n.object)) return;
+        if (kBounceOnConnect) {
             scheduleRouteReset(@"post-connect");
         }
+        // Auto-resume any music that was playing before the drop. Fires after a
+        // short delay so the A2DP route has time to come up; tryResumePlayback
+        // is internally rate-limited (won't fire if nothing was playing or the
+        // drop is stale).
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kResumePlaybackDelaySec * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ tryResumePlayback(@"post-connect"); });
     });
     observe(@"BluetoothDeviceConnectFailedNotification", @"connect-failed", ^(NSNotification *n) {});
     observe(@"BluetoothDeviceUpdatedNotification", @"device-updated", ^(NSNotification *n) {});
