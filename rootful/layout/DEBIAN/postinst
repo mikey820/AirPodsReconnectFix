@@ -1,26 +1,20 @@
 #!/bin/sh
-# v2.7.0 pivot: the fix is audio-route bouncing (SpringBoard side), NOT BTServer
-# injection — that daemon can't be injected (dyld strips the insert). So here we
-# UNDO any BTServer.plist patch left by 2.6.x, restoring the pristine system file
-# and reloading the daemon. No system files are modified going forward.
+# v2.7.2: SpringBoard-only tweak. Only thing postinst still has to do is run
+# `aprfctl uninstall` once to scrub any leftover env-var keys 2.5.x/2.6.x added
+# to BTServer.plist on first install (idempotent — no-op if there's nothing to
+# strip). We DO NOT unload/load BTServer anymore: that bricks Bluetooth until
+# reboot if `load` doesn't bring it back cleanly, and there's nothing in the
+# plist for the daemon to re-read either.
 
 TOOL=/usr/libexec/airpodsreconnectfix/aprfctl
-PL=/System/Library/LaunchDaemons/com.apple.BTServer.plist
 LOG=/var/mobile/AirPodsReconnectFix.log
 
-echo "$(date) [postinst] v2.7.0 — restoring BTServer.plist (abandoning daemon-injection route)" >> "$LOG" 2>/dev/null
+echo "$(date) [postinst] v2.7.2 — SpringBoard-only build, scrubbing any legacy BTServer.plist edits" >> "$LOG" 2>/dev/null
 /sbin/mount -u -o rw / 2>/dev/null || mount -u -o rw / 2>/dev/null || true
 
 if [ -x "$TOOL" ]; then
     "$TOOL" uninstall || echo "$(date) [postinst] aprfctl uninstall returned $?" >> "$LOG" 2>/dev/null
-    chmod 644 "$PL" 2>/dev/null || true
-    chown root:wheel "$PL" 2>/dev/null || true
-    # Reload so the daemon drops the (now-removed) insert immediately.
-    LC=launchctl; [ -x /bin/launchctl ] && LC=/bin/launchctl
-    "$LC" unload "$PL" 2>/dev/null || true
-    sleep 1
-    "$LC" load "$PL" 2>/dev/null || true
 fi
 
-echo "AirPodsReconnectFix 2.7.0 installed (audio-route fix; BTServer.plist restored)."
+echo "AirPodsReconnectFix 2.7.2 installed. Respring to activate."
 exit 0

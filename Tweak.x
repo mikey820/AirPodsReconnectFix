@@ -132,82 +132,123 @@ static BOOL deviceLooksLikeAirPods(BluetoothDevice *dev) {
 // Per the bounty owner: the real bug isn't the BT link dropping — it's the
 // AUDIO stalling while the AirPods stay connected. The manual cure is to open
 // the AirPlay/output picker and switch to the iPhone speaker and back to the
-// AirPods a few times. We automate exactly that via MPAVRoutingController
-// (MediaPlayer.framework, private; introduced in iOS 6 — perfect for us), which
-// is what the system route picker itself drives. This needs NO daemon injection.
-static const double kBounceGapSec   = 0.8;   // dwell on speaker before going back
+// AirPods a few times. We automate exactly that via MPAudioDeviceController
+// (MediaPlayer.framework, private — the iOS-6 equivalent of MPAVRoutingController
+// from iOS 7+; the v2.7.1 class dump confirmed it's the right class on this
+// device). It exposes pickSpeakerRoute / pickRouteAtIndex: and a numbered list
+// of routes via numberOfAudioRoutes + routeNameAtIndex:isPicked:. No daemon
+// injection needed; runs entirely in SpringBoard.
+static const double kBounceGapSec   = 0.8;   // dwell on each route before flipping
 static const int    kBounceRepeats  = 3;     // owner said "a few times"
 
-@interface MPAVRoute : NSObject
-- (NSString *)routeName;
-- (NSString *)routeUID;
-- (long long)routeType;
-- (NSUInteger)routeSubtype;
-- (BOOL)isPicked;
-@end
-
-@interface MPAVRoutingController : NSObject
+@interface MPAudioDeviceController : NSObject
 - (id)init;
-- (NSArray *)availableRoutes;
-- (BOOL)pickRoute:(MPAVRoute *)route;
-- (MPAVRoute *)pickedRoute;
+- (void)setCategory:(NSString *)category;
+- (void)setRouteDiscoveryEnabled:(BOOL)enabled;
+- (unsigned int)numberOfAudioRoutes;
+- (NSString *)routeNameAtIndex:(unsigned int)idx isPicked:(BOOL *)picked;
+- (NSString *)nameOfPickedRoute;
+- (unsigned int)indexOfPickedRoute;
+- (void)pickRouteAtIndex:(unsigned int)idx;
+- (void)pickSpeakerRoute;
+- (void)restorePickedRoute;
+- (BOOL)wirelessRouteIsPicked;
+- (BOOL)speakerRouteIsPicked;
+- (BOOL)routeOtherThanHandsetIsAvailable;
 @end
 
-static BOOL routeIsSpeaker(MPAVRoute *r) {
-    NSString *n = [r respondsToSelector:@selector(routeName)] ? [r routeName] : nil;
-    // Built-in output is named "iPhone"/"Speaker"/"Receiver" depending on build.
-    return strHas(n, @"speaker") || strHas(n, @"iphone") || strHas(n, @"receiver");
-}
-static BOOL routeIsAirPods(MPAVRoute *r) {
-    NSString *n = [r respondsToSelector:@selector(routeName)] ? [r routeName] : nil;
-    return strHas(n, @"airpod");
+// Each bounce uses one shared controller so route discovery stays warm across
+// the back-and-forth and we don't churn through init/dealloc cycles.
+static MPAudioDeviceController *gADC;
+
+static MPAudioDeviceController *audioController(void) {
+    if (gADC) return gADC;
+    Class C = objc_getClass("MPAudioDeviceController");
+    if (!C) { AFLog(@"[route] MPAudioDeviceController class missing"); return nil; }
+    gADC = [[C alloc] init];
+    if ([gADC respondsToSelector:@selector(setCategory:)]) {
+        // "Playback" is the AVAudioSession playback category string on iOS 6;
+        // tells the audio device controller we're picking for media playback so
+        // it considers BT A2DP routes as candidates.
+        [gADC setCategory:@"Playback"];
+    }
+    if ([gADC respondsToSelector:@selector(setRouteDiscoveryEnabled:)]) {
+        [gADC setRouteDiscoveryEnabled:YES];
+    }
+    return gADC;
 }
 
-// One step of the bounce: pick `wantAirPods ? AirPods : speaker`, then schedule
-// the opposite, repeating a few times so the audio path gets fully re-kicked.
+// Find the route index whose name matches `needle` (case-insensitive substring).
+// Returns -1 if none. Used to locate the AirPods route by name after we've
+// switched away from it (we can't keep an index — the order can change).
+static int routeIndexMatching(MPAudioDeviceController *adc, NSString *needle) {
+    if (!adc) return -1;
+    unsigned int n = [adc respondsToSelector:@selector(numberOfAudioRoutes)] ? [adc numberOfAudioRoutes] : 0;
+    for (unsigned int i = 0; i < n; i++) {
+        BOOL picked = NO;
+        NSString *name = [adc routeNameAtIndex:i isPicked:&picked];
+        if (strHas(name, needle)) return (int)i;
+    }
+    return -1;
+}
+
+// Log every available route + which is picked. Diagnostic, called before bounce.
+static void logRoutes(MPAudioDeviceController *adc, NSString *tag) {
+    if (!adc) return;
+    @try {
+        unsigned int n = [adc numberOfAudioRoutes];
+        AFLog(@"[route][%@] %u available, picked=%@", tag, n,
+              [adc respondsToSelector:@selector(nameOfPickedRoute)] ? [adc nameOfPickedRoute] : @"?");
+        for (unsigned int i = 0; i < n; i++) {
+            BOOL picked = NO;
+            NSString *name = [adc routeNameAtIndex:i isPicked:&picked];
+            AFLog(@"[route][%@] [%u] name=%@ picked=%d", tag, i, name, picked);
+        }
+    } @catch (NSException *e) {
+        AFLog(@"[route][EXC log] %@ %@", e.name, e.reason);
+    }
+}
+
+// One step of the bounce. wantAirPods=NO -> pick speaker; wantAirPods=YES ->
+// find AirPods index by name and pick it. Reschedules itself for `remaining`
+// more steps with the opposite target, ending on AirPods.
 static void bounceStep(int remaining, BOOL wantAirPods) {
     @try {
-        Class C = objc_getClass("MPAVRoutingController");
-        if (!C) { AFLog(@"[route] MPAVRoutingController not found"); return; }
-        MPAVRoutingController *rc = [[C alloc] init];
-        NSArray *routes = [rc availableRoutes];
-        MPAVRoute *target = nil, *speaker = nil, *pods = nil;
-        for (MPAVRoute *r in routes) {
-            if (routeIsSpeaker(r)) speaker = r;
-            if (routeIsAirPods(r)) pods = r;
+        MPAudioDeviceController *adc = audioController();
+        if (!adc) return;
+        if (wantAirPods) {
+            int idx = routeIndexMatching(adc, @"airpod");
+            // Fallback: any non-handset wireless route (could be named after
+            // the device, e.g. "Mikey's AirPods Pro - Find My").
+            if (idx < 0) {
+                unsigned int n = [adc numberOfAudioRoutes];
+                for (unsigned int i = 0; i < n; i++) {
+                    BOOL picked = NO;
+                    NSString *name = [adc routeNameAtIndex:i isPicked:&picked];
+                    if (strHas(name, @"speaker") || strHas(name, @"iphone") || strHas(name, @"receiver")) continue;
+                    idx = (int)i; break;
+                }
+            }
+            AFLog(@"[route] step rem=%d -> AirPods idx=%d", remaining, idx);
+            if (idx >= 0) [adc pickRouteAtIndex:(unsigned int)idx];
+        } else {
+            AFLog(@"[route] step rem=%d -> speaker", remaining);
+            if ([adc respondsToSelector:@selector(pickSpeakerRoute)]) [adc pickSpeakerRoute];
         }
-        target = wantAirPods ? pods : speaker;
-        AFLog(@"[route] step rem=%d want=%@ -> target=%@ (speaker=%@ pods=%@)",
-              remaining, wantAirPods ? @"AirPods" : @"speaker",
-              [target respondsToSelector:@selector(routeName)] ? [target routeName] : @"<nil>",
-              speaker ? @"y" : @"n", pods ? @"y" : @"n");
-        if (target) [rc pickRoute:target];
     } @catch (NSException *e) {
-        AFLog(@"[route][EXC] %@ %@", e.name, e.reason);
+        AFLog(@"[route][EXC step] %@ %@", e.name, e.reason);
     }
     if (remaining <= 0) { AFLog(@"[route] bounce done"); return; }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kBounceGapSec * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ bounceStep(remaining - 1, !wantAirPods); });
 }
 
-// Log the current routes (diagnostic) then bounce speaker<->AirPods a few times,
-// ending back on the AirPods.
 static void resetAudioRoute(NSString *why) {
-    @try {
-        Class C = objc_getClass("MPAVRoutingController");
-        if (!C) { AFLog(@"[route] MPAVRoutingController unavailable (%@)", why); return; }
-        MPAVRoutingController *rc = [[C alloc] init];
-        for (MPAVRoute *r in [rc availableRoutes]) {
-            AFLog(@"[route] avail name=%@ type=%lld picked=%d",
-                  [r respondsToSelector:@selector(routeName)] ? [r routeName] : @"?",
-                  [r respondsToSelector:@selector(routeType)] ? [r routeType] : -1,
-                  [r respondsToSelector:@selector(isPicked)] ? [r isPicked] : -1);
-        }
-    } @catch (NSException *e) {
-        AFLog(@"[route][EXC enum] %@ %@", e.name, e.reason);
-    }
+    MPAudioDeviceController *adc = audioController();
+    if (!adc) { AFLog(@"[route] no controller (%@)", why); return; }
+    logRoutes(adc, why);
     AFLog(@"[route] bounce start (%@): speaker<->AirPods x%d", why, kBounceRepeats);
-    // Start by going to the speaker; bounce ends on AirPods. Total picks ~= 2*repeats.
+    // Start at speaker (NO), bounce 2*repeats-1 more times so we END on AirPods.
     bounceStep(kBounceRepeats * 2 - 1, NO);
 }
 
@@ -365,60 +406,15 @@ static void dumpClassMethods(Class cls, const char *why) {
     }
 }
 
-// One-time diagnostic: enumerate every MediaPlayer class that looks audio/route/
-// device-related and dump its method list. MPAVRoutingController is iOS 7+ — on
-// iOS 6 the equivalent is a different private class (likely MPAudioDeviceController
-// or MPVolumeController), and we don't know its exact API without seeing it. This
-// dump tells v2.7.2 which class to use and what selectors to call.
-static void dumpMediaPlayerClassesOnce(void) {
-    static BOOL done = NO;
-    if (done) return;
-    done = YES;
-    // Force-load MediaPlayer — we link against it, but make sure it's mapped
-    // before we ask the runtime for its classes.
-    void *h = dlopen("/System/Library/Frameworks/MediaPlayer.framework/MediaPlayer", RTLD_NOW);
-    AFLog(@"[route][dump] MediaPlayer dlopen=%p", h);
-    unsigned int n = 0;
-    Class *L = objc_copyClassList(&n);
-    int hits = 0;
-    for (unsigned int i = 0; i < n; i++) {
-        const char *cn = class_getName(L[i]);
-        if (!cn || cn[0] != 'M' || cn[1] != 'P') continue;
-        NSString *name = @(cn);
-        BOOL interesting = strHas(name, @"Route") || strHas(name, @"Audio") ||
-                           strHas(name, @"Device") || strHas(name, @"Output") ||
-                           strHas(name, @"AV") || strHas(name, @"Volume") ||
-                           strHas(name, @"AirPlay") || strHas(name, @"Picker");
-        if (!interesting) continue;
-        AFLog(@"[route][class] %s", cn);
-        hits++;
-        // For controller-type classes (the ones likely to expose a pick/select
-        // API), also dump every instance + class method so we can read off the
-        // right entry point.
-        if (strHas(name, @"Controller")) {
-            for (int meta = 0; meta < 2; meta++) {
-                Class c = meta ? object_getClass((id)L[i]) : L[i];
-                unsigned int mc = 0;
-                Method *ms = class_copyMethodList(c, &mc);
-                for (unsigned int j = 0; j < mc; j++) {
-                    AFLog(@"[route][meth] %s %c%s", cn,
-                          meta ? '+' : '-', sel_getName(method_getName(ms[j])));
-                }
-                if (ms) free(ms);
-            }
-        }
-    }
-    if (L) free(L);
-    AFLog(@"[route][dump] %d candidate MP audio/route classes", hits);
-}
-
 static void setupSpringBoard(void) {
     AFLog(@"[SpringBoard] installing BluetoothManager observers (autoReconnect=%s)",
           kAutoReconnectEnabled ? "YES" : "NO");
 
-    // Run the MP class dump once at startup so the next build knows the iOS-6
-    // routing API. MPAVRoutingController is iOS 7+ and confirmed missing here.
-    dumpMediaPlayerClassesOnce();
+    // Force-load MediaPlayer so MPAudioDeviceController is available the first
+    // time we ask for it (we link against it, but make sure it's mapped).
+    void *h = dlopen("/System/Library/Frameworks/MediaPlayer.framework/MediaPlayer", RTLD_NOW);
+    AFLog(@"[route] MediaPlayer dlopen=%p MPAudioDeviceController=%@",
+          h, objc_getClass("MPAudioDeviceController") ? @"present" : @"MISSING");
 
     // These notification names are posted by BluetoothManager. We register for
     // a generous set so we capture whatever this iOS build actually fires.
