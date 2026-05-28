@@ -1,6 +1,6 @@
 Package: com.mikey820.airpodsreconnectfix
 Name: AirPodsReconnectFix
-Version: 2.7.6
+Version: 2.7.7
 Architecture: iphoneos-arm
 Description: Burst-reconnect AirPods on iOS 6 (post-AirPods-Pro-3 firmware) + auto-resume — aiming to beat the audio-pause window so music never interrupts
 Maintainer: mikey820 <mikey820@users.noreply.github.com>

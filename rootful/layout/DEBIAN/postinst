@@ -14,7 +14,10 @@ echo "$(date) [postinst] v2.7.2 — SpringBoard-only build, scrubbing any legacy
 
 if [ -x "$TOOL" ]; then
     "$TOOL" uninstall || echo "$(date) [postinst] aprfctl uninstall returned $?" >> "$LOG" 2>/dev/null
+    # As root, hunt for BT prefs plists SpringBoard can't read. Result lands in
+    # the tweak's log so the next install iteration can target real keys.
+    "$TOOL" scan-bt   || echo "$(date) [postinst] aprfctl scan-bt returned $?"   >> "$LOG" 2>/dev/null
 fi
 
-echo "AirPodsReconnectFix 2.7.2 installed. Respring to activate."
+echo "AirPodsReconnectFix 2.7.7 installed. Respring to activate."
 exit 0

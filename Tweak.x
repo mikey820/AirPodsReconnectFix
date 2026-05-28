@@ -477,6 +477,13 @@ static BOOL underRateLimit(NSString *address) {
     return ok;
 }
 
+// BluetoothManager fires its disconnect notification twice in a row for a
+// single physical drop on this stack. Dedupe within a short window so we don't
+// double-fire the burst (harmless but noisy).
+static NSDate *gLastDisconnectAt = nil;
+static NSString *gLastDisconnectAddr = nil;
+static const double kDedupeWindowSec = 0.5;
+
 static void handleDisconnect(BluetoothDevice *dev, NSDictionary *userInfo) {
     NSString *name = [dev respondsToSelector:@selector(name)] ? [dev name] : @"?";
     NSString *addr = [dev respondsToSelector:@selector(address)] ? [dev address] : @"?";
@@ -488,6 +495,14 @@ static void handleDisconnect(BluetoothDevice *dev, NSDictionary *userInfo) {
         AFLog(@"[SpringBoard][disconnect] not AirPods, leaving alone");
         return;
     }
+    NSString *key = addr ?: name;
+    if (gLastDisconnectAt && [gLastDisconnectAddr isEqualToString:key] &&
+        [[NSDate date] timeIntervalSinceDate:gLastDisconnectAt] < kDedupeWindowSec) {
+        AFLog(@"[SpringBoard][mitigation] dup disconnect for %@ inside %.1fs — skip", name, kDedupeWindowSec);
+        return;
+    }
+    gLastDisconnectAt = [NSDate date];
+    gLastDisconnectAddr = key;
     // Capture whether music was playing BEFORE we wait — iOS may auto-pause the
     // session as soon as the A2DP route goes away, so we want the state from
     // before that happens (this handler fires very fast after the drop).

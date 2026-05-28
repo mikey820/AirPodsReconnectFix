@@ -102,13 +102,81 @@ static int doUninstall(NSFileManager *fm) {
     return 0;
 }
 
+// scan-bt: as root, hunt for every Bluetooth preferences plist on disk and dump
+// its contents to the log so we can see what per-device keys actually exist.
+// SpringBoard runs as `mobile`, which can't read /var/wireless/ — so this
+// discovery has to happen here. Searches /var and /Library recursively, filters
+// for files matching *Bluetooth*.plist (case-insensitive). For any dict-valued
+// entry that mentions an AirPods name or the user's MAC, every key/value is
+// logged so v2.7.8 can target the right setting via -setServiceSetting:key:value:.
+static void scanDir(NSString *root, NSFileManager *fm, NSMutableArray *out) {
+    NSDirectoryEnumerator *en = [fm enumeratorAtPath:root];
+    NSString *sub;
+    while ((sub = [en nextObject])) {
+        // Skip giant uninteresting trees to keep this snappy.
+        if ([sub hasPrefix:@"mobile/Containers"] ||
+            [sub hasPrefix:@"mobile/Media"] ||
+            [sub hasPrefix:@"mobile/Applications"] ||
+            [sub hasPrefix:@"db/timezone"] ||
+            [sub hasPrefix:@"db/dyld"] ||
+            [sub hasPrefix:@"logs"]) { [en skipDescendents]; continue; }
+        NSString *low = [sub.lowercaseString lastPathComponent];
+        if (![low hasSuffix:@".plist"]) continue;
+        if ([low rangeOfString:@"bluetooth"].location == NSNotFound) continue;
+        [out addObject:[root stringByAppendingPathComponent:sub]];
+    }
+}
+
+static int doScanBT(NSFileManager *fm) {
+    plog(@"scan-bt: start");
+    NSMutableArray *hits = [NSMutableArray array];
+    for (NSString *root in @[ @"/var", @"/Library", @"/private/var" ]) {
+        if (![fm fileExistsAtPath:root]) continue;
+        @try { scanDir(root, fm, hits); }
+        @catch (NSException *e) { plog(@"scan-bt: exception scanning %@: %@", root, e.reason); }
+    }
+    plog(@"scan-bt: found %u candidate plists", (unsigned)hits.count);
+    for (NSString *path in hits) {
+        @try {
+            plog(@"scan-bt: %@", path);
+            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:path];
+            if (!d) { plog(@"scan-bt:   (not a dict-typed plist)"); continue; }
+            plog(@"scan-bt:   top keys=%@", [d allKeys]);
+            // If the file maps MAC->dict (devices/services plists), dump each
+            // sub-dict in full so we see every per-device key.
+            for (NSString *k in d) {
+                id v = d[k];
+                if (![v isKindOfClass:[NSDictionary class]]) continue;
+                NSDictionary *sub = (NSDictionary *)v;
+                NSString *nm = sub[@"Name"] ?: sub[@"name"] ?: @"";
+                BOOL match = [nm.lowercaseString rangeOfString:@"airpod"].location != NSNotFound ||
+                             [k.lowercaseString hasPrefix:@"14:14:7d"];
+                if (!match) {
+                    // Still log a one-liner so we know the shape of the file.
+                    plog(@"scan-bt:     [%@] name=%@ keys=%@", k, nm, [sub allKeys]);
+                    continue;
+                }
+                plog(@"scan-bt:   ** AirPods entry %@ (%@) **", k, nm);
+                for (NSString *dk in sub) {
+                    plog(@"scan-bt:     %@.%@ = %@", k, dk, sub[dk]);
+                }
+            }
+        } @catch (NSException *e) {
+            plog(@"scan-bt: read %@ failed: %@", path, e.reason);
+        }
+    }
+    plog(@"scan-bt: done");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     @autoreleasepool {
         NSString *cmd = argc > 1 ? [NSString stringWithUTF8String:argv[1]] : @"";
         NSFileManager *fm = [NSFileManager defaultManager];
         if ([cmd isEqualToString:@"install"])   return doInstall(fm);
         if ([cmd isEqualToString:@"uninstall"]) return doUninstall(fm);
-        fprintf(stderr, "usage: aprfctl install|uninstall\n");
+        if ([cmd isEqualToString:@"scan-bt"])   return doScanBT(fm);
+        fprintf(stderr, "usage: aprfctl install|uninstall|scan-bt\n");
         return 2;
     }
 }
