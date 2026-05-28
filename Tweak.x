@@ -249,27 +249,30 @@ static void logRoutes(MPAudioDeviceController *adc, NSString *tag) {
 }
 
 // One step of the bounce. wantAirPods=NO -> pick speaker; wantAirPods=YES ->
-// find AirPods index by name and pick it. Reschedules itself for `remaining`
-// more steps with the opposite target, ending on AirPods.
+// restore the previously-picked route (the AirPods, since we just switched away
+// from them). Reschedules itself for `remaining` more steps with the opposite
+// target, ending on AirPods.
+//
+// We use -restorePickedRoute (an MPAudioDeviceController API explicitly built
+// for "go back to what was picked before") rather than pickRouteAtIndex:N,
+// because on iOS 6 the indexed route list only populates when a route-picker
+// UI is mounted — outside that context, numberOfAudioRoutes returns 1 with a
+// nil name even when wireless routes are clearly available
+// (routeOtherThanHandsetAndSpeakerIsAvailable=YES). restorePickedRoute works
+// without that UI context.
 static void bounceStep(int remaining, BOOL wantAirPods) {
     @try {
         MPAudioDeviceController *adc = audioController();
         if (!adc) return;
         if (wantAirPods) {
-            int idx = routeIndexMatching(adc, @"airpod");
-            // Fallback: any non-handset wireless route (could be named after
-            // the device, e.g. "Mikey's AirPods Pro - Find My").
-            if (idx < 0) {
-                unsigned int n = [adc numberOfAudioRoutes];
-                for (unsigned int i = 0; i < n; i++) {
-                    BOOL picked = NO;
-                    NSString *name = [adc routeNameAtIndex:i isPicked:&picked];
-                    if (strHas(name, @"speaker") || strHas(name, @"iphone") || strHas(name, @"receiver")) continue;
-                    idx = (int)i; break;
-                }
+            AFLog(@"[route] step rem=%d -> restore (AirPods)", remaining);
+            if ([adc respondsToSelector:@selector(restorePickedRoute)]) {
+                [adc restorePickedRoute];
+            } else {
+                // Fallback: by-name index lookup if it happens to be populated.
+                int idx = routeIndexMatching(adc, @"airpod");
+                if (idx >= 0) [adc pickRouteAtIndex:(unsigned int)idx];
             }
-            AFLog(@"[route] step rem=%d -> AirPods idx=%d", remaining, idx);
-            if (idx >= 0) [adc pickRouteAtIndex:(unsigned int)idx];
         } else {
             AFLog(@"[route] step rem=%d -> speaker", remaining);
             if ([adc respondsToSelector:@selector(pickSpeakerRoute)]) [adc pickSpeakerRoute];
@@ -292,13 +295,22 @@ static void resetAudioRoute(NSString *why) {
     waitForRoutesThen(0, ^{
         MPAudioDeviceController *a = audioController();
         logRoutes(a, why);
-        if ([a numberOfAudioRoutes] <= 1) {
-            AFLog(@"[route] still only %u route after wait — skipping bounce (%@)",
-                  [a numberOfAudioRoutes], why);
+        // Gate the bounce on "is there a wireless / non-handset-non-speaker route
+        // available" — this returns YES even when the indexed route list is
+        // empty (which is normal outside a route-picker UI context). If no
+        // external route exists at all, bouncing to speaker would lose audio.
+        BOOL extra = [a respondsToSelector:@selector(routeOtherThanHandsetAndSpeakerIsAvailable)]
+                     && [a routeOtherThanHandsetAndSpeakerIsAvailable];
+        BOOL wirelessPicked = [a respondsToSelector:@selector(wirelessRouteIsPicked)]
+                              && [a wirelessRouteIsPicked];
+        if (!extra && !wirelessPicked) {
+            AFLog(@"[route] no external route available — skipping bounce (%@)", why);
             return;
         }
-        AFLog(@"[route] bounce start (%@): speaker<->AirPods x%d", why, kBounceRepeats);
-        // Start at speaker (NO), bounce 2*repeats-1 more times so we END on AirPods.
+        AFLog(@"[route] bounce start (%@): speaker<->restorePicked x%d (extra=%d wireless=%d)",
+              why, kBounceRepeats, extra, wirelessPicked);
+        // Start at speaker (NO), bounce 2*repeats-1 more times so we END on
+        // restored (AirPods).
         bounceStep(kBounceRepeats * 2 - 1, NO);
     });
 }
