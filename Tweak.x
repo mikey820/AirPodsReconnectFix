@@ -142,9 +142,11 @@ static const double kBounceGapSec   = 0.8;   // dwell on each route before flipp
 static const int    kBounceRepeats  = 3;     // owner said "a few times"
 
 @interface MPAudioDeviceController : NSObject
++ (void)setRouteDiscoveryEnabled:(BOOL)enabled;
 - (id)init;
 - (void)setCategory:(NSString *)category;
 - (void)setRouteDiscoveryEnabled:(BOOL)enabled;
+- (void)clearCachedRoutes;
 - (unsigned int)numberOfAudioRoutes;
 - (NSString *)routeNameAtIndex:(unsigned int)idx isPicked:(BOOL *)picked;
 - (NSString *)nameOfPickedRoute;
@@ -155,6 +157,7 @@ static const int    kBounceRepeats  = 3;     // owner said "a few times"
 - (BOOL)wirelessRouteIsPicked;
 - (BOOL)speakerRouteIsPicked;
 - (BOOL)routeOtherThanHandsetIsAvailable;
+- (BOOL)routeOtherThanHandsetAndSpeakerIsAvailable;
 @end
 
 // Each bounce uses one shared controller so route discovery stays warm across
@@ -165,6 +168,11 @@ static MPAudioDeviceController *audioController(void) {
     if (gADC) return gADC;
     Class C = objc_getClass("MPAudioDeviceController");
     if (!C) { AFLog(@"[route] MPAudioDeviceController class missing"); return nil; }
+    // Class-level discovery flag (separate from per-instance) — turn it on first
+    // so the very first instance starts populating its cache immediately.
+    if ([C respondsToSelector:@selector(setRouteDiscoveryEnabled:)]) {
+        [C setRouteDiscoveryEnabled:YES];
+    }
     gADC = [[C alloc] init];
     if ([gADC respondsToSelector:@selector(setCategory:)]) {
         // "Playback" is the AVAudioSession playback category string on iOS 6;
@@ -175,7 +183,38 @@ static MPAudioDeviceController *audioController(void) {
     if ([gADC respondsToSelector:@selector(setRouteDiscoveryEnabled:)]) {
         [gADC setRouteDiscoveryEnabled:YES];
     }
+    if ([gADC respondsToSelector:@selector(clearCachedRoutes)]) {
+        [gADC clearCachedRoutes];
+    }
     return gADC;
+}
+
+// Discovery is async — after enabling it the cache stays empty for a beat. Spin
+// until either we see >1 route OR a non-null route name OR an explicit
+// "non-handset-non-speaker route is available" signal, capped so we never
+// loop forever. Calls `then` on the main queue once routes look populated.
+static const double kRouteWaitStepSec   = 0.4;
+static const int    kRouteWaitMaxSteps  = 12;  // ~4.8s ceiling
+static void waitForRoutesThen(int step, void(^then)(void)) {
+    MPAudioDeviceController *adc = audioController();
+    if (!adc) { then(); return; }
+    unsigned int n = [adc respondsToSelector:@selector(numberOfAudioRoutes)] ? [adc numberOfAudioRoutes] : 0;
+    BOOL hasNamed = NO;
+    for (unsigned int i = 0; i < n; i++) {
+        BOOL picked = NO;
+        NSString *name = [adc routeNameAtIndex:i isPicked:&picked];
+        if (name.length > 0) { hasNamed = YES; break; }
+    }
+    BOOL extra = [adc respondsToSelector:@selector(routeOtherThanHandsetAndSpeakerIsAvailable)]
+                 && [adc routeOtherThanHandsetAndSpeakerIsAvailable];
+    if ((n > 1 && hasNamed) || extra || step >= kRouteWaitMaxSteps) {
+        AFLog(@"[route] routes ready after %d steps (n=%u named=%d extra=%d)",
+              step, n, hasNamed, extra);
+        then();
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kRouteWaitStepSec * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ waitForRoutesThen(step + 1, then); });
 }
 
 // Find the route index whose name matches `needle` (case-insensitive substring).
@@ -246,10 +285,22 @@ static void bounceStep(int remaining, BOOL wantAirPods) {
 static void resetAudioRoute(NSString *why) {
     MPAudioDeviceController *adc = audioController();
     if (!adc) { AFLog(@"[route] no controller (%@)", why); return; }
-    logRoutes(adc, why);
-    AFLog(@"[route] bounce start (%@): speaker<->AirPods x%d", why, kBounceRepeats);
-    // Start at speaker (NO), bounce 2*repeats-1 more times so we END on AirPods.
-    bounceStep(kBounceRepeats * 2 - 1, NO);
+    // Kick a fresh discovery cycle so we're not picking against stale/empty cache.
+    if ([adc respondsToSelector:@selector(clearCachedRoutes)]) [adc clearCachedRoutes];
+    if ([adc respondsToSelector:@selector(setRouteDiscoveryEnabled:)]) [adc setRouteDiscoveryEnabled:YES];
+    AFLog(@"[route] waiting for discovery (%@)", why);
+    waitForRoutesThen(0, ^{
+        MPAudioDeviceController *a = audioController();
+        logRoutes(a, why);
+        if ([a numberOfAudioRoutes] <= 1) {
+            AFLog(@"[route] still only %u route after wait — skipping bounce (%@)",
+                  [a numberOfAudioRoutes], why);
+            return;
+        }
+        AFLog(@"[route] bounce start (%@): speaker<->AirPods x%d", why, kBounceRepeats);
+        // Start at speaker (NO), bounce 2*repeats-1 more times so we END on AirPods.
+        bounceStep(kBounceRepeats * 2 - 1, NO);
+    });
 }
 
 // Debounced entry point so multiple triggers in quick succession collapse to one
@@ -415,6 +466,9 @@ static void setupSpringBoard(void) {
     void *h = dlopen("/System/Library/Frameworks/MediaPlayer.framework/MediaPlayer", RTLD_NOW);
     AFLog(@"[route] MediaPlayer dlopen=%p MPAudioDeviceController=%@",
           h, objc_getClass("MPAudioDeviceController") ? @"present" : @"MISSING");
+    // Warm route discovery now so the cache is populated by the time AirPods
+    // connect — otherwise the first post-connect bounce hits an empty list.
+    (void)audioController();
 
     // These notification names are posted by BluetoothManager. We register for
     // a generous set so we capture whatever this iOS build actually fires.
