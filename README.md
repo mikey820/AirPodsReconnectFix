@@ -1,3 +1,5 @@
+# ts does not work yet
+
 # AirPodsReconnectFix  (iOS 6)
 
 A diagnostic + mitigation tweak for the **AirPods Bluetooth disconnect/reconnect
