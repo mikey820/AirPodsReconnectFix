@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <sys/stat.h>
+#import <dlfcn.h>
 
 // AirPodsReconnectFix  (iOS 6 / armv7)
 //
@@ -364,9 +365,60 @@ static void dumpClassMethods(Class cls, const char *why) {
     }
 }
 
+// One-time diagnostic: enumerate every MediaPlayer class that looks audio/route/
+// device-related and dump its method list. MPAVRoutingController is iOS 7+ — on
+// iOS 6 the equivalent is a different private class (likely MPAudioDeviceController
+// or MPVolumeController), and we don't know its exact API without seeing it. This
+// dump tells v2.7.2 which class to use and what selectors to call.
+static void dumpMediaPlayerClassesOnce(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    // Force-load MediaPlayer — we link against it, but make sure it's mapped
+    // before we ask the runtime for its classes.
+    void *h = dlopen("/System/Library/Frameworks/MediaPlayer.framework/MediaPlayer", RTLD_NOW);
+    AFLog(@"[route][dump] MediaPlayer dlopen=%p", h);
+    unsigned int n = 0;
+    Class *L = objc_copyClassList(&n);
+    int hits = 0;
+    for (unsigned int i = 0; i < n; i++) {
+        const char *cn = class_getName(L[i]);
+        if (!cn || cn[0] != 'M' || cn[1] != 'P') continue;
+        NSString *name = @(cn);
+        BOOL interesting = strHas(name, @"Route") || strHas(name, @"Audio") ||
+                           strHas(name, @"Device") || strHas(name, @"Output") ||
+                           strHas(name, @"AV") || strHas(name, @"Volume") ||
+                           strHas(name, @"AirPlay") || strHas(name, @"Picker");
+        if (!interesting) continue;
+        AFLog(@"[route][class] %s", cn);
+        hits++;
+        // For controller-type classes (the ones likely to expose a pick/select
+        // API), also dump every instance + class method so we can read off the
+        // right entry point.
+        if (strHas(name, @"Controller")) {
+            for (int meta = 0; meta < 2; meta++) {
+                Class c = meta ? object_getClass((id)L[i]) : L[i];
+                unsigned int mc = 0;
+                Method *ms = class_copyMethodList(c, &mc);
+                for (unsigned int j = 0; j < mc; j++) {
+                    AFLog(@"[route][meth] %s %c%s", cn,
+                          meta ? '+' : '-', sel_getName(method_getName(ms[j])));
+                }
+                if (ms) free(ms);
+            }
+        }
+    }
+    if (L) free(L);
+    AFLog(@"[route][dump] %d candidate MP audio/route classes", hits);
+}
+
 static void setupSpringBoard(void) {
     AFLog(@"[SpringBoard] installing BluetoothManager observers (autoReconnect=%s)",
           kAutoReconnectEnabled ? "YES" : "NO");
+
+    // Run the MP class dump once at startup so the next build knows the iOS-6
+    // routing API. MPAVRoutingController is iOS 7+ and confirmed missing here.
+    dumpMediaPlayerClassesOnce();
 
     // These notification names are posted by BluetoothManager. We register for
     // a generous set so we capture whatever this iOS build actually fires.

@@ -1,8 +1,8 @@
 Package: com.mikey820.airpodsreconnectfix
 Name: AirPodsReconnectFix
-Version: 2.7.0
+Version: 2.7.1
 Architecture: iphoneos-arm
-Description: Fix AirPods audio cut-outs on iOS 6 by auto-bouncing the output route (no Mac needed)
+Description: Diagnostic: dumps iOS-6 MediaPlayer route classes (MPAVRoutingController is iOS 7+, need iOS-6 equivalent)
 Maintainer: mikey820 <mikey820@users.noreply.github.com>
 Author: mikey820
 Section: Tweaks
