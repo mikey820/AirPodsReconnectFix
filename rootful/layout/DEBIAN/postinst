@@ -1,39 +1,26 @@
 #!/bin/sh
-# Patch BTServer's launchd plist to force-load our dylib (MobileSubstrate won't
-# inject the daemon on iOS 6). Never abort dpkg on failure — a failed patch just
-# means no daemon injection, which is harmless.
+# v2.7.0 pivot: the fix is audio-route bouncing (SpringBoard side), NOT BTServer
+# injection — that daemon can't be injected (dyld strips the insert). So here we
+# UNDO any BTServer.plist patch left by 2.6.x, restoring the pristine system file
+# and reloading the daemon. No system files are modified going forward.
 
 TOOL=/usr/libexec/airpodsreconnectfix/aprfctl
 PL=/System/Library/LaunchDaemons/com.apple.BTServer.plist
 LOG=/var/mobile/AirPodsReconnectFix.log
 
-echo "$(date) [postinst] running; remounting / rw and patching" >> "$LOG" 2>/dev/null
-# /System lives on the root partition, which may be mounted read-only at runtime.
+echo "$(date) [postinst] v2.7.0 — restoring BTServer.plist (abandoning daemon-injection route)" >> "$LOG" 2>/dev/null
 /sbin/mount -u -o rw / 2>/dev/null || mount -u -o rw / 2>/dev/null || true
 
 if [ -x "$TOOL" ]; then
-    "$TOOL" install || echo "$(date) [postinst] aprfctl install returned $?" >> "$LOG" 2>/dev/null
+    "$TOOL" uninstall || echo "$(date) [postinst] aprfctl uninstall returned $?" >> "$LOG" 2>/dev/null
     chmod 644 "$PL" 2>/dev/null || true
     chown root:wheel "$PL" 2>/dev/null || true
-
-    # Restart BTServer NOW so it re-reads the patched plist and (if dyld honors
-    # the insert) loads our dylib immediately — no reboot-timing ambiguity. A
-    # plain `stop` would respawn from the already-loaded job (old env), so we
-    # unload+load to force launchd to re-read the plist. Best-effort.
-    echo "$(date) [postinst] reloading BTServer via launchctl" >> "$LOG" 2>/dev/null
+    # Reload so the daemon drops the (now-removed) insert immediately.
     LC=launchctl; [ -x /bin/launchctl ] && LC=/bin/launchctl
     "$LC" unload "$PL" 2>/dev/null || true
     sleep 1
     "$LC" load "$PL" 2>/dev/null || true
-    echo "$(date) [postinst] BTServer reload requested" >> "$LOG" 2>/dev/null
-else
-    echo "$(date) [postinst] tool missing at $TOOL" >> "$LOG" 2>/dev/null
 fi
 
-echo "==================================================================="
-echo " AirPodsReconnectFix: BTServer.plist patched + daemon reloaded."
-echo " (If Bluetooth misbehaves, a reboot or uninstall fixes it. Backup at"
-echo "  /Library/AirPodsReconnectFix/BTServer.plist.orig; uninstall restores"
-echo "  it automatically. Patch result is in /var/mobile/AirPodsReconnectFix.log.)"
-echo "==================================================================="
+echo "AirPodsReconnectFix 2.7.0 installed (audio-route fix; BTServer.plist restored)."
 exit 0

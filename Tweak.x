@@ -95,8 +95,15 @@ static const double kWindowSec   = 60.0;
 // device, which may be enough to keep the link "warm". Fires comfortably inside
 // the ~47s window. (If the drop happens even with this running, it's a true
 // link-layer failure that needs daemon access — not an idle timeout.)
-static const BOOL   kKeepAliveEnabled = YES;
+// Disabled: proved it does NOT stop the drops, and the drop turned out to be an
+// audio-routing glitch, not a link timeout. Kept off to avoid pointless traffic.
+static const BOOL   kKeepAliveEnabled = NO;
 static const double kKeepAliveSec     = 25.0;
+
+// Bounce the audio route automatically a couple seconds after the AirPods
+// connect (when audio is most likely to come up stalled). Debounced.
+static const BOOL   kBounceOnConnect  = YES;
+static const double kBounceOnConnectDelaySec = 2.0;
 
 // ---- BluetoothManager.framework (private, stable across iOS versions) ------
 @interface BluetoothDevice : NSObject
@@ -118,6 +125,111 @@ static const double kKeepAliveSec     = 25.0;
 static BOOL deviceLooksLikeAirPods(BluetoothDevice *dev) {
     if (![dev respondsToSelector:@selector(name)]) return NO;
     return strHas([dev name], @"airpod");
+}
+
+// ---- Audio-route bounce (THE actual fix) -----------------------------------
+// Per the bounty owner: the real bug isn't the BT link dropping — it's the
+// AUDIO stalling while the AirPods stay connected. The manual cure is to open
+// the AirPlay/output picker and switch to the iPhone speaker and back to the
+// AirPods a few times. We automate exactly that via MPAVRoutingController
+// (MediaPlayer.framework, private; introduced in iOS 6 — perfect for us), which
+// is what the system route picker itself drives. This needs NO daemon injection.
+static const double kBounceGapSec   = 0.8;   // dwell on speaker before going back
+static const int    kBounceRepeats  = 3;     // owner said "a few times"
+
+@interface MPAVRoute : NSObject
+- (NSString *)routeName;
+- (NSString *)routeUID;
+- (long long)routeType;
+- (NSUInteger)routeSubtype;
+- (BOOL)isPicked;
+@end
+
+@interface MPAVRoutingController : NSObject
+- (id)init;
+- (NSArray *)availableRoutes;
+- (BOOL)pickRoute:(MPAVRoute *)route;
+- (MPAVRoute *)pickedRoute;
+@end
+
+static BOOL routeIsSpeaker(MPAVRoute *r) {
+    NSString *n = [r respondsToSelector:@selector(routeName)] ? [r routeName] : nil;
+    // Built-in output is named "iPhone"/"Speaker"/"Receiver" depending on build.
+    return strHas(n, @"speaker") || strHas(n, @"iphone") || strHas(n, @"receiver");
+}
+static BOOL routeIsAirPods(MPAVRoute *r) {
+    NSString *n = [r respondsToSelector:@selector(routeName)] ? [r routeName] : nil;
+    return strHas(n, @"airpod");
+}
+
+// One step of the bounce: pick `wantAirPods ? AirPods : speaker`, then schedule
+// the opposite, repeating a few times so the audio path gets fully re-kicked.
+static void bounceStep(int remaining, BOOL wantAirPods) {
+    @try {
+        Class C = objc_getClass("MPAVRoutingController");
+        if (!C) { AFLog(@"[route] MPAVRoutingController not found"); return; }
+        MPAVRoutingController *rc = [[C alloc] init];
+        NSArray *routes = [rc availableRoutes];
+        MPAVRoute *target = nil, *speaker = nil, *pods = nil;
+        for (MPAVRoute *r in routes) {
+            if (routeIsSpeaker(r)) speaker = r;
+            if (routeIsAirPods(r)) pods = r;
+        }
+        target = wantAirPods ? pods : speaker;
+        AFLog(@"[route] step rem=%d want=%@ -> target=%@ (speaker=%@ pods=%@)",
+              remaining, wantAirPods ? @"AirPods" : @"speaker",
+              [target respondsToSelector:@selector(routeName)] ? [target routeName] : @"<nil>",
+              speaker ? @"y" : @"n", pods ? @"y" : @"n");
+        if (target) [rc pickRoute:target];
+    } @catch (NSException *e) {
+        AFLog(@"[route][EXC] %@ %@", e.name, e.reason);
+    }
+    if (remaining <= 0) { AFLog(@"[route] bounce done"); return; }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kBounceGapSec * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ bounceStep(remaining - 1, !wantAirPods); });
+}
+
+// Log the current routes (diagnostic) then bounce speaker<->AirPods a few times,
+// ending back on the AirPods.
+static void resetAudioRoute(NSString *why) {
+    @try {
+        Class C = objc_getClass("MPAVRoutingController");
+        if (!C) { AFLog(@"[route] MPAVRoutingController unavailable (%@)", why); return; }
+        MPAVRoutingController *rc = [[C alloc] init];
+        for (MPAVRoute *r in [rc availableRoutes]) {
+            AFLog(@"[route] avail name=%@ type=%lld picked=%d",
+                  [r respondsToSelector:@selector(routeName)] ? [r routeName] : @"?",
+                  [r respondsToSelector:@selector(routeType)] ? [r routeType] : -1,
+                  [r respondsToSelector:@selector(isPicked)] ? [r isPicked] : -1);
+        }
+    } @catch (NSException *e) {
+        AFLog(@"[route][EXC enum] %@ %@", e.name, e.reason);
+    }
+    AFLog(@"[route] bounce start (%@): speaker<->AirPods x%d", why, kBounceRepeats);
+    // Start by going to the speaker; bounce ends on AirPods. Total picks ~= 2*repeats.
+    bounceStep(kBounceRepeats * 2 - 1, NO);
+}
+
+// Debounced entry point so multiple triggers in quick succession collapse to one
+// bounce, and so the bounce always runs on the main thread after a short delay.
+static BOOL gRouteResetPending;
+static void scheduleRouteReset(NSString *why) {
+    if (gRouteResetPending) { AFLog(@"[route] reset already pending, skip (%@)", why); return; }
+    gRouteResetPending = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kBounceOnConnectDelaySec * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        gRouteResetPending = NO;
+        resetAudioRoute(why);
+    });
+}
+
+// Manual trigger: `notifyutil -p com.mikey820.airpodsreconnectfix.bounce`, or any
+// app/tool posting this Darwin notification, fires a bounce on demand — the
+// hands-free version of the owner's "flip the output route" workaround.
+static void darwinBounceCb(CFNotificationCenterRef c, void *o, CFStringRef name,
+                           const void *obj, CFDictionaryRef info) {
+    AFLog(@"[route] darwin trigger received");
+    scheduleRouteReset(@"darwin");
 }
 
 // Generate a little link traffic to (hopefully) reset an idle/sniff timeout.
@@ -261,11 +373,23 @@ static void setupSpringBoard(void) {
     observe(@"BluetoothDeviceDisconnectSuccessNotification", @"disconnect", ^(NSNotification *n) {
         handleDisconnect((BluetoothDevice *)n.object, n.userInfo);
     });
-    observe(@"BluetoothDeviceConnectSuccessNotification", @"connect", ^(NSNotification *n) {});
+    observe(@"BluetoothDeviceConnectSuccessNotification", @"connect", ^(NSNotification *n) {
+        if (kBounceOnConnect && deviceLooksLikeAirPods((BluetoothDevice *)n.object)) {
+            scheduleRouteReset(@"post-connect");
+        }
+    });
     observe(@"BluetoothDeviceConnectFailedNotification", @"connect-failed", ^(NSNotification *n) {});
     observe(@"BluetoothDeviceUpdatedNotification", @"device-updated", ^(NSNotification *n) {});
     observe(@"BluetoothConnectabilityChangedNotification", @"connectability", ^(NSNotification *n) {});
     observe(@"BluetoothAvailabilityChangedNotification", @"availability", ^(NSNotification *n) {});
+
+    // Manual on-demand bounce via Darwin notification (hands-free version of the
+    // owner's "flip the output route" fix; trigger with notifyutil -p <name>).
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+        NULL, darwinBounceCb,
+        CFSTR("com.mikey820.airpodsreconnectfix.bounce"), NULL,
+        CFNotificationSuspensionBehaviorCoalesce);
+    AFLog(@"[route] manual trigger ready: notifyutil -p com.mikey820.airpodsreconnectfix.bounce");
 
     // Start the keep-alive loop once. It self-reschedules and re-fetches the
     // live connected device on every tick, so it's safe whether or not anything
