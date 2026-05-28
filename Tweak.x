@@ -93,18 +93,21 @@ static const int    kBurstCount       = (int)(sizeof(kBurstDelaysSec)/sizeof(kBu
 static const int    kMaxAttempts = 6;
 static const double kWindowSec   = 60.0;
 
-// ---- Keep-alive ------------------------------------------------------------
-// The drop is a dead-regular ~47s cycle. If that's an idle / power-save (sniff)
-// timeout, generating a little link traffic before it fires should reset the
-// timer and stop the disconnect. We can't touch the link layer from here, but
-// reading battery / service state over BluetoothManager does round-trip the
-// device, which may be enough to keep the link "warm". Fires comfortably inside
-// the ~47s window. (If the drop happens even with this running, it's a true
-// link-layer failure that needs daemon access — not an idle timeout.)
-// Disabled: proved it does NOT stop the drops, and the drop turned out to be an
-// audio-routing glitch, not a link timeout. Kept off to avoid pointless traffic.
-static const BOOL   kKeepAliveEnabled = NO;
-static const double kKeepAliveSec     = 25.0;
+// ---- Pre-emptive service re-assert -----------------------------------------
+// The drop is a dead-regular ~45s cycle (every disconnect in the logs lands
+// 42–49s after the prior connect — a timer firing, not interference). Two forms
+// of mere link *activity* have already FAILED to stop it: (1) reading
+// battery/service state every 25s, and (2) a continuous silent A2DP stream
+// (asentientbot's ios-6-pods-hack). So the new firmware tears the ACL link down
+// on its own timer regardless of traffic. The one host-side lever left untried:
+// actively RE-ASSERT the service connection via -connectWithServices: a few
+// seconds before the ~45s deadline, in case re-running the service-connect path
+// resets whatever timer the firmware counts. Anchored to each connect (not
+// wall-clock) and generation-gated so a disconnect cancels pending re-asserts.
+// DECISION GATE: if the next log STILL shows ~45s drops with these re-asserts
+// firing, pre-emption from a userspace tweak is conclusively dead and we pivot
+// to making the reconnect itself seamless instead.
+static const double kPreemptIntervalSec = 18.0;  // pokes at ~18s, 36s … < 45s
 
 // Bounce the audio route automatically a couple seconds after AirPods connect.
 // DISABLED: confirmed on-device that the speaker leg of the bounce pauses the
@@ -426,32 +429,60 @@ static void darwinBounceCb(CFNotificationCenterRef c, void *o, CFStringRef name,
     scheduleRouteReset(@"darwin");
 }
 
-// Generate a little link traffic to (hopefully) reset an idle/sniff timeout.
+// Pre-emptive service re-assert. Fires every kPreemptIntervalSec while AirPods
+// are connected, so a re-assert always lands a few seconds before the ~45s
+// firmware teardown. Unlike the old gentle poke (which only READ battery/state
+// and did nothing to the link), this actively calls -connectWithServices: on the
+// live device to re-run the service-connect path — the strongest host-side
+// action short of a full reconnect.
 //
 // CRITICAL: never retain a BluetoothDevice across time. The wrapper holds a raw
 // pointer to a daemon-side device struct; retaining the ObjC object does NOT
 // keep that struct alive, so poking a stale device later is a dangling-pointer
 // crash (SIGSEGV — uncatchable by @try, this is what was crashing SpringBoard).
 // So we re-fetch the live connectedDevices fresh on every single tick.
-static void keepAliveTick(void) {
+//
+// Generation-gated: startPreempt() bumps gPreemptGen and seeds a tick carrying
+// that gen; each tick reschedules itself only while its gen is still current.
+// A disconnect (stopPreempt) bumps the gen, orphaning any pending tick.
+static int gPreemptGen = 0;
+
+static void preemptTick(int gen) {
+    if (gen != gPreemptGen) return;  // superseded by a newer connect/disconnect
     @try {
         Class mgrC = objc_getClass("BluetoothManager");
         BluetoothManager *m = mgrC ? [mgrC sharedInstance] : nil;
         NSArray *devs = [m respondsToSelector:@selector(connectedDevices)] ? [m connectedDevices] : nil;
-        BOOL poked = NO;
+        BOOL acted = NO;
         for (BluetoothDevice *d in devs) {
             if (!deviceLooksLikeAirPods(d)) continue;
             if (![d respondsToSelector:@selector(connected)] || ![d connected]) continue;
-            int batt = [d respondsToSelector:@selector(batteryLevel)] ? [d batteryLevel] : -1;
-            AFLog(@"[SpringBoard][keepalive] poked %@ (batt=%d)", [d name], batt);
-            poked = YES;
+            if ([d respondsToSelector:@selector(connectWithServices:)]) {
+                AFLog(@"[SpringBoard][preempt] RE-ASSERT connectWithServices:~0 on %@ (before ~45s drop)", [d name]);
+                [d connectWithServices:(unsigned int)~0u];
+                acted = YES;
+            }
         }
-        if (!poked) AFLog(@"[SpringBoard][keepalive] skip (no connected AirPods right now)");
+        if (!acted) AFLog(@"[SpringBoard][preempt] skip (no connected AirPods right now)");
     } @catch (NSException *e) {
-        AFLog(@"[SpringBoard][keepalive][EXC] %@ %@", e.name, e.reason);
+        AFLog(@"[SpringBoard][preempt][EXC] %@ %@", e.name, e.reason);
     }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kKeepAliveSec * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ keepAliveTick(); });
+    if (gen != gPreemptGen) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kPreemptIntervalSec * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ preemptTick(gen); });
+}
+
+static void startPreempt(NSString *why) {
+    int gen = ++gPreemptGen;  // invalidate any previous schedule, start fresh
+    AFLog(@"[SpringBoard][preempt] START (%@) — re-assert every %.0fs", why, kPreemptIntervalSec);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kPreemptIntervalSec * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ preemptTick(gen); });
+}
+
+static void stopPreempt(NSString *why) {
+    if (gPreemptGen == 0) return;
+    gPreemptGen++;  // orphans the pending tick
+    AFLog(@"[SpringBoard][preempt] STOP (%@)", why);
 }
 
 // address -> NSMutableArray<NSDate*> of recent reconnect attempts.
@@ -677,17 +708,20 @@ static void setupSpringBoard(void) {
     // These notification names are posted by BluetoothManager. We register for
     // a generous set so we capture whatever this iOS build actually fires.
     observe(@"BluetoothDeviceDisconnectSuccessNotification", @"disconnect", ^(NSNotification *n) {
-        handleDisconnect((BluetoothDevice *)n.object, n.userInfo);
+        BluetoothDevice *d = (BluetoothDevice *)n.object;
+        if (deviceLooksLikeAirPods(d)) stopPreempt(@"AirPods disconnect");
+        handleDisconnect(d, n.userInfo);
     });
     observe(@"BluetoothDeviceConnectSuccessNotification", @"connect", ^(NSNotification *n) {
         if (!deviceLooksLikeAirPods((BluetoothDevice *)n.object)) return;
+        // Pre-emption experiment: re-assert the service connection a few seconds
+        // before the firmware's ~45s teardown, anchored to this connect.
+        startPreempt(@"AirPods connect");
         if (kBounceOnConnect) {
             scheduleRouteReset(@"post-connect");
         }
-        // Auto-resume any music that was playing before the drop. Fires after a
-        // short delay so the A2DP route has time to come up; tryResumePlayback
-        // is internally rate-limited (won't fire if nothing was playing or the
-        // drop is stale).
+        // Safety net: if a drop happens anyway, resume any music that was
+        // playing before. Internally rate-limited (no-op if nothing to resume).
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kResumePlaybackDelaySec * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ tryResumePlayback(@"post-connect"); });
     });
@@ -704,14 +738,9 @@ static void setupSpringBoard(void) {
         CFNotificationSuspensionBehaviorCoalesce);
     AFLog(@"[route] manual trigger ready: notifyutil -p com.mikey820.airpodsreconnectfix.bounce");
 
-    // Start the keep-alive loop once. It self-reschedules and re-fetches the
-    // live connected device on every tick, so it's safe whether or not anything
-    // is connected yet.
-    if (kKeepAliveEnabled) {
-        AFLog(@"[SpringBoard][keepalive] starting, every %.0fs", kKeepAliveSec);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kKeepAliveSec * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{ keepAliveTick(); });
-    }
+    // The pre-empt loop is anchored to each connect (startPreempt in the connect
+    // observer + the startup snapshot below), not kicked off here, so a re-assert
+    // always lands relative to when the link actually came up.
 
     // One-shot snapshot of what's currently connected, for context in the logs.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
@@ -720,6 +749,14 @@ static void setupSpringBoard(void) {
         if (!mgr) { AFLog(@"[SpringBoard] BluetoothManager class not found"); return; }
         BluetoothManager *m = [mgr sharedInstance];
         AFLog(@"[SpringBoard] snapshot connectedDevices=%@", [m connectedDevices]);
+        // If AirPods are already connected at SpringBoard load (e.g. respring
+        // while still wearing them), start the pre-empt re-assert loop now.
+        for (BluetoothDevice *d in [m connectedDevices]) {
+            if (deviceLooksLikeAirPods(d)) {
+                startPreempt(@"already-connected at startup");
+                break;
+            }
+        }
 
         // One-time surface dump. The daemon-side classes only load into BTServer
         // (needs a reboot to inject), but BluetoothManager/BluetoothDevice live

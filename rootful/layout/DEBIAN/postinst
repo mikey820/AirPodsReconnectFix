@@ -19,5 +19,5 @@ if [ -x "$TOOL" ]; then
     "$TOOL" scan-bt   || echo "$(date) [postinst] aprfctl scan-bt returned $?"   >> "$LOG" 2>/dev/null
 fi
 
-echo "AirPodsReconnectFix 2.7.7 installed. Respring to activate."
+echo "AirPodsReconnectFix 2.7.8 installed. Respring to activate."
 exit 0
