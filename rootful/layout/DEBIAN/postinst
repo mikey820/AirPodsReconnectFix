@@ -15,15 +15,25 @@ if [ -x "$TOOL" ]; then
     "$TOOL" install || echo "$(date) [postinst] aprfctl install returned $?" >> "$LOG" 2>/dev/null
     chmod 644 "$PL" 2>/dev/null || true
     chown root:wheel "$PL" 2>/dev/null || true
+
+    # Restart BTServer NOW so it re-reads the patched plist and (if dyld honors
+    # the insert) loads our dylib immediately — no reboot-timing ambiguity. A
+    # plain `stop` would respawn from the already-loaded job (old env), so we
+    # unload+load to force launchd to re-read the plist. Best-effort.
+    echo "$(date) [postinst] reloading BTServer via launchctl" >> "$LOG" 2>/dev/null
+    LC=launchctl; [ -x /bin/launchctl ] && LC=/bin/launchctl
+    "$LC" unload "$PL" 2>/dev/null || true
+    sleep 1
+    "$LC" load "$PL" 2>/dev/null || true
+    echo "$(date) [postinst] BTServer reload requested" >> "$LOG" 2>/dev/null
 else
     echo "$(date) [postinst] tool missing at $TOOL" >> "$LOG" 2>/dev/null
 fi
 
 echo "==================================================================="
-echo " AirPodsReconnectFix: BTServer.plist patch attempted."
-echo " REBOOT the device for it to take effect."
-echo " (Backup at /Library/AirPodsReconnectFix/BTServer.plist.orig;"
-echo "  uninstalling restores it automatically. Check the log at"
-echo "  /var/mobile/AirPodsReconnectFix.log for the patch result.)"
+echo " AirPodsReconnectFix: BTServer.plist patched + daemon reloaded."
+echo " (If Bluetooth misbehaves, a reboot or uninstall fixes it. Backup at"
+echo "  /Library/AirPodsReconnectFix/BTServer.plist.orig; uninstall restores"
+echo "  it automatically. Patch result is in /var/mobile/AirPodsReconnectFix.log.)"
 echo "==================================================================="
 exit 0
