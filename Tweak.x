@@ -81,11 +81,16 @@ static void AFLog(NSString *fmt, ...) {
 // Auto-reconnect is the only behaviour that changes device state. Everything
 // else is pure logging. Flip to NO to ship a logging-only diagnostic build.
 static const BOOL  kAutoReconnectEnabled = YES;
-// Wait this long after a drop before re-issuing connect (let bluetoothd settle).
-static const double kReconnectDelaySec = 1.5;
-// Allow at most this many reconnect attempts inside the rolling window before
+// Burst-retry connect at these offsets (seconds) after the disconnect fires.
+// The first one is essentially synchronous — goal is to issue -connect before
+// iOS's audio session times out and pauses music. Subsequent retries cover the
+// case where the first attempt lands before BTServer is ready to honor it.
+static const double kBurstDelaysSec[] = { 0.0, 0.25, 0.6, 1.2 };
+static const int    kBurstCount       = (int)(sizeof(kBurstDelaysSec)/sizeof(kBurstDelaysSec[0]));
+// Allow at most this many reconnect BURSTS inside the rolling window before
 // backing off — so we never fight a genuinely-gone device or loop forever.
-static const int    kMaxAttempts = 4;
+// (One burst = up to kBurstCount -connect calls for the same disconnect.)
+static const int    kMaxAttempts = 6;
 static const double kWindowSec   = 60.0;
 
 // ---- Keep-alive ------------------------------------------------------------
@@ -126,10 +131,15 @@ static const double kResumeMaxStaleSec         = 30.0;
 - (NSString *)name;
 - (NSString *)address;
 - (BOOL)connected;
+- (BOOL)paired;
 - (void)connect;
+- (void)connectWithServices:(unsigned int)services;
 - (void)disconnect;
 - (int)batteryLevel;
 - (NSArray *)connectedServices;
+- (unsigned int)connectedServicesCount;
+- (id)getServiceSetting:(unsigned int)svc key:(id)key;
+- (BOOL)setServiceSetting:(unsigned int)svc key:(id)key value:(id)val;
 @end
 
 @interface BluetoothManager : NSObject
@@ -486,22 +496,35 @@ static void handleDisconnect(BluetoothDevice *dev, NSDictionary *userInfo) {
         AFLog(@"[SpringBoard][mitigation] rate limit hit for %@ — backing off", name);
         return;
     }
-    AFLog(@"[SpringBoard][mitigation] scheduling reconnect for %@ in %.1fs", name, kReconnectDelaySec);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kReconnectDelaySec * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        @try {
-            if ([dev respondsToSelector:@selector(connected)] && [dev connected]) {
-                AFLog(@"[SpringBoard][mitigation] %@ already back — no action", name);
-                return;
+    AFLog(@"[SpringBoard][mitigation] BURST reconnect for %@ at %d offsets", name, kBurstCount);
+    // Fire connect attempts back-to-back so at least one lands inside iOS's
+    // audio-session-keepalive window. Each attempt no-ops cleanly if the device
+    // is already back by then.
+    for (int i = 0; i < kBurstCount; i++) {
+        double offset = kBurstDelaysSec[i];
+        int idx = i;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(offset * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @try {
+                if ([dev respondsToSelector:@selector(connected)] && [dev connected]) {
+                    AFLog(@"[SpringBoard][mitigation] %@ already back at burst[%d] — skip", name, idx);
+                    return;
+                }
+                // Prefer connectWithServices: when available — reactivates the
+                // specific A2DP service vs a full pairing handshake. Pass ~0
+                // (all services) so we get HFP back too if it was up.
+                if ([dev respondsToSelector:@selector(connectWithServices:)]) {
+                    AFLog(@"[SpringBoard][mitigation] burst[%d] -connectWithServices:~0 on %@", idx, name);
+                    [dev connectWithServices:(unsigned int)~0u];
+                } else if ([dev respondsToSelector:@selector(connect)]) {
+                    AFLog(@"[SpringBoard][mitigation] burst[%d] -connect on %@", idx, name);
+                    [dev connect];
+                }
+            } @catch (NSException *e) {
+                AFLog(@"[SpringBoard][EXC] reconnect %@ burst[%d]: %@ %@", name, idx, e.name, e.reason);
             }
-            if ([dev respondsToSelector:@selector(connect)]) {
-                AFLog(@"[SpringBoard][mitigation] issuing -connect on %@", name);
-                [dev connect];
-            }
-        } @catch (NSException *e) {
-            AFLog(@"[SpringBoard][EXC] reconnect %@: %@ %@", name, e.name, e.reason);
-        }
-    });
+        });
+    }
 }
 
 static void dumpClassMethods(Class cls, const char *why);  // defined below
@@ -564,6 +587,77 @@ static void setupSpringBoard(void) {
     // Warm route discovery now so the cache is populated by the time AirPods
     // connect — otherwise the first post-connect bounce hits an empty list.
     (void)audioController();
+
+    // One-shot dump of every BT preferences plist we can find on disk, so we
+    // can see what -setServiceSetting:key:value: keys actually exist for this
+    // device (and which one might let us prevent the disconnect entirely).
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+        NSArray *paths = @[
+            @"/var/preferences/SystemConfiguration/com.apple.MobileBluetooth.devices.plist",
+            @"/var/preferences/SystemConfiguration/com.apple.MobileBluetooth.services.plist",
+            @"/var/wireless/Library/Preferences/com.apple.MobileBluetooth.devices.plist",
+            @"/var/wireless/Library/Preferences/com.apple.MobileBluetooth.services.plist",
+            @"/var/mobile/Library/Preferences/com.apple.MobileBluetooth.plist",
+            @"/var/mobile/Library/Preferences/com.apple.Bluetooth.plist",
+            @"/Library/Preferences/com.apple.MobileBluetooth.devices.plist",
+            @"/Library/Preferences/com.apple.MobileBluetooth.services.plist",
+        ];
+        for (NSString *p in paths) {
+            if (![[NSFileManager defaultManager] fileExistsAtPath:p]) continue;
+            @try {
+                NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
+                if (!d) { AFLog(@"[btprefs] %@ — exists but not a plist dict", p); continue; }
+                AFLog(@"[btprefs] %@ keys=%@", p, [d allKeys]);
+                // Devices plist usually maps MAC string -> per-device dict. Log
+                // the AirPods entry in full if we can spot it.
+                for (NSString *k in d) {
+                    id v = d[k];
+                    if (![v isKindOfClass:[NSDictionary class]]) continue;
+                    NSDictionary *dev = (NSDictionary *)v;
+                    NSString *nm = dev[@"Name"] ?: dev[@"name"];
+                    if (!strHas(nm, @"airpod") && ![k hasPrefix:@"14:14:7D"]) continue;
+                    AFLog(@"[btprefs] device %@ (%@) keys=%@", k, nm, [dev allKeys]);
+                    for (NSString *dk in dev) {
+                        AFLog(@"[btprefs] %@.%@ = %@", k, dk, dev[dk]);
+                    }
+                }
+            } @catch (NSException *e) {
+                AFLog(@"[btprefs][EXC] %@: %@", p, e.reason);
+            }
+        }
+    });
+
+    // Also probe -getServiceSetting:key: on the device with common candidate
+    // keys, so we can see which ones return non-nil (= are real). Fires once
+    // when we first see a connected AirPods device.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @try {
+            Class mgr = objc_getClass("BluetoothManager");
+            BluetoothManager *m = [mgr sharedInstance];
+            for (BluetoothDevice *d in [m connectedDevices]) {
+                if (!deviceLooksLikeAirPods(d)) continue;
+                if (![d respondsToSelector:@selector(getServiceSetting:key:)]) continue;
+                NSArray *keys = @[
+                    @"AutoConnect", @"PreferredConnections", @"SupportsBatteryLevel",
+                    @"AudioCategory", @"DeviceClass", @"Connectable",
+                    @"SupervisionTimeout", @"LinkPolicy", @"LinkSupervisionTimeout",
+                    @"SniffMode", @"SniffInterval", @"PowerSave",
+                    @"ServiceClass", @"PreferredServices", @"DefaultServices",
+                    @"RoleSwitchAllowed", @"AuthRequired",
+                ];
+                for (unsigned int svc = 0; svc < 8; svc++) {
+                    for (NSString *k in keys) {
+                        id v = nil;
+                        @try { v = [d getServiceSetting:svc key:k]; } @catch (NSException *e) {}
+                        if (v) AFLog(@"[btsetting] svc=%u key=%@ = %@", svc, k, v);
+                    }
+                }
+            }
+        } @catch (NSException *e) {
+            AFLog(@"[btsetting][EXC] %@ %@", e.name, e.reason);
+        }
+    });
 
     // These notification names are posted by BluetoothManager. We register for
     // a generous set so we capture whatever this iOS build actually fires.
