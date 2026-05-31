@@ -448,7 +448,7 @@ static void startHeal(NSString *why) {
                    dispatch_get_main_queue(), ^{ healTick(gen); });
 }
 
-static void stopHeal(NSString *why) {
+__attribute__((unused)) static void stopHeal(NSString *why) {
     if (gHealGen == 0) return;
     gHealGen++;   // orphan the pending tick
     AFLog(@"[heal] STOP (%@)", why);
@@ -889,8 +889,8 @@ static void setupSpringBoard(void) {
     });
 }
 
-// ---- bluetoothd: read-only runtime dump ------------------------------------
-static void dumpBluetoothdRuntime(void) {
+// ---- bluetoothd: read-only runtime dump (retained for diagnostics) ---------
+__attribute__((unused)) static void dumpBluetoothdRuntime(void) {
     AFLog(@"[bluetoothd] runtime dump start");
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
