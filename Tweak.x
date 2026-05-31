@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <sys/stat.h>
 #import <dlfcn.h>
@@ -338,6 +339,119 @@ static void logRoutes(MPAudioDeviceController *adc, NSString *tag) {
     } @catch (NSException *e) {
         AFLog(@"[route][EXC log] %@ %@", e.name, e.reason);
     }
+}
+
+// ---- Auto route-heal (THE skip/pause + system-sound fix) -------------------
+// The proven manual cure for the iOS-6 A2DP routing bug is the Control Center
+// route flip back to the AirPods. We automate exactly that. The catch found in
+// earlier diagnostics: outside a route-picker UI, MPAudioDeviceController in
+// SpringBoard is blind — numberOfAudioRoutes returns 1 with a nil name, so the
+// AirPods aren't a pickable indexed route. A live MPVolumeView activates the
+// same AirPlay route discovery the Control Center route sheet uses, which makes
+// the AirPods enumerate as a real indexed route we can pick. We mount one in a
+// hidden, offscreen, non-interactive window so it stays invisible.
+static UIWindow *gRouteWin = nil;
+static id        gVolView  = nil;
+static void ensureRouteDiscovery(void) {
+    if (gRouteWin) return;
+    @try {
+        Class VV = objc_getClass("MPVolumeView");
+        if (!VV) { AFLog(@"[heal] MPVolumeView class missing"); return; }
+        gRouteWin = [[UIWindow alloc] initWithFrame:CGRectMake(-1000, -1000, 8, 8)];
+        gRouteWin.windowLevel = 0;
+        gRouteWin.userInteractionEnabled = NO;
+        gRouteWin.backgroundColor = [UIColor clearColor];
+        gVolView = [[VV alloc] initWithFrame:CGRectMake(0, 0, 8, 8)];
+        [gRouteWin addSubview:gVolView];
+        gRouteWin.hidden = NO;   // must be live in a window hierarchy for discovery
+        AFLog(@"[heal] route-discovery volume view mounted (offscreen)");
+    } @catch (NSException *e) { AFLog(@"[heal][EXC mount] %@ %@", e.name, e.reason); }
+}
+
+// Snapshot of what the route picker sees — the diagnostic that tells us whether
+// the MPVolumeView trick populated the list (nRoutes>1) and what's picked.
+static void logADCRoutes(NSString *tag) {
+    @try {
+        MPAudioDeviceController *adc = audioController();
+        if (!adc) { AFLog(@"[adc][%@] no controller", tag); return; }
+        BOOL wp = [adc respondsToSelector:@selector(wirelessRouteIsPicked)] && [adc wirelessRouteIsPicked];
+        BOOL sp = [adc respondsToSelector:@selector(speakerRouteIsPicked)] && [adc speakerRouteIsPicked];
+        BOOL extra = [adc respondsToSelector:@selector(routeOtherThanHandsetAndSpeakerIsAvailable)]
+                     && [adc routeOtherThanHandsetAndSpeakerIsAvailable];
+        AFLog(@"[adc][%@] nRoutes=%u picked=%@ wirelessPicked=%d speakerPicked=%d extraAvail=%d",
+              tag, [adc numberOfAudioRoutes],
+              [adc respondsToSelector:@selector(nameOfPickedRoute)] ? [adc nameOfPickedRoute] : @"?",
+              wp, sp, extra);
+        for (unsigned int i = 0; i < [adc numberOfAudioRoutes]; i++) {
+            BOOL picked = NO;
+            NSString *name = [adc routeNameAtIndex:i isPicked:&picked];
+            AFLog(@"[adc][%@] [%u] name=%@ picked=%d", tag, i, name, picked);
+        }
+    } @catch (NSException *e) { AFLog(@"[adc][EXC] %@ %@", e.name, e.reason); }
+}
+
+// Re-pick the AirPods route IFF audio has drifted off them. This ONLY ever picks
+// the AirPods (matched by name) — never the speaker — so it is structurally
+// incapable of stranding audio on the speaker (the v2.7.11 regression that broke
+// every previous attempt). No-op if already on the AirPods, or if the route list
+// hasn't populated yet.
+static void healRoute(NSString *why) {
+    @try {
+        MPAudioDeviceController *adc = audioController();
+        if (!adc) return;
+        unsigned int n = [adc numberOfAudioRoutes];
+        if (n <= 1) return;                          // list not populated — nothing pickable
+        int idx = routeIndexMatching(adc, @"airpod");
+        if (idx < 0) return;                         // AirPods not enumerated — can't/won't act
+        BOOL picked = NO;
+        [adc routeNameAtIndex:(unsigned int)idx isPicked:&picked];
+        if (picked) return;                          // already on AirPods — nothing to do
+        AFLog(@"[heal] audio drifted off AirPods — re-picking route idx=%d (%@)", idx, why);
+        [adc pickRouteAtIndex:(unsigned int)idx];
+    } @catch (NSException *e) { AFLog(@"[heal][EXC] %@ %@", e.name, e.reason); }
+}
+
+// Heal loop. Anchored to the AirPods connection and generation-gated exactly
+// like the pre-empt loop: startHeal bumps the gen; each tick reschedules only
+// while its gen is current; a disconnect (stopHeal) orphans the pending tick.
+// Every tick: keep discovery alive, log the picker's view, and heal if drifted.
+static int gHealGen = 0;
+static const double kHealTickSec = 2.5;   // re-pick within ~2.5s of a skip/pause
+
+static void healTick(int gen) {
+    if (gen != gHealGen) return;
+    @try {
+        ensureRouteDiscovery();
+        MPAudioDeviceController *adc = audioController();
+        if (adc) {
+            // If the list still hasn't populated, kick a fresh discovery cycle.
+            if ([adc numberOfAudioRoutes] <= 1) {
+                if ([adc respondsToSelector:@selector(clearCachedRoutes)]) [adc clearCachedRoutes];
+                if ([adc respondsToSelector:@selector(setRouteDiscoveryEnabled:)]) [adc setRouteDiscoveryEnabled:YES];
+            }
+            logADCRoutes(@"heal");
+            healRoute(@"heal");
+        }
+    } @catch (NSException *e) { AFLog(@"[heal][EXC tick] %@ %@", e.name, e.reason); }
+    if (gen != gHealGen) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kHealTickSec * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ healTick(gen); });
+}
+
+static void startHeal(NSString *why) {
+    int gen = ++gHealGen;
+    AFLog(@"[heal] START (%@) — re-pick AirPods route if it drifts, every %.1fs", why, kHealTickSec);
+    // Mount discovery immediately (on main) so the list is populating before the
+    // first tick fires.
+    ensureRouteDiscovery();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kHealTickSec * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ healTick(gen); });
+}
+
+static void stopHeal(NSString *why) {
+    if (gHealGen == 0) return;
+    gHealGen++;   // orphan the pending tick
+    AFLog(@"[heal] STOP (%@)", why);
 }
 
 // One step of the bounce. wantAirPods=NO -> pick speaker; wantAirPods=YES ->
@@ -709,7 +823,7 @@ static void setupSpringBoard(void) {
     // a generous set so we capture whatever this iOS build actually fires.
     observe(@"BluetoothDeviceDisconnectSuccessNotification", @"disconnect", ^(NSNotification *n) {
         BluetoothDevice *d = (BluetoothDevice *)n.object;
-        if (deviceLooksLikeAirPods(d)) stopPreempt(@"AirPods disconnect");
+        if (deviceLooksLikeAirPods(d)) { stopPreempt(@"AirPods disconnect"); stopHeal(@"AirPods disconnect"); }
         handleDisconnect(d, n.userInfo);
     });
     observe(@"BluetoothDeviceConnectSuccessNotification", @"connect", ^(NSNotification *n) {
@@ -717,6 +831,9 @@ static void setupSpringBoard(void) {
         // Pre-emption experiment: re-assert the service connection a few seconds
         // before the firmware's ~45s teardown, anchored to this connect.
         startPreempt(@"AirPods connect");
+        // Auto route-heal: re-pick the AirPods output whenever audio drifts off
+        // them after a skip/pause/system-sound gap. Safe (only ever picks AirPods).
+        startHeal(@"AirPods connect");
         if (kBounceOnConnect) {
             scheduleRouteReset(@"post-connect");
         }
@@ -754,6 +871,7 @@ static void setupSpringBoard(void) {
         for (BluetoothDevice *d in [m connectedDevices]) {
             if (deviceLooksLikeAirPods(d)) {
                 startPreempt(@"already-connected at startup");
+                startHeal(@"already-connected at startup");
                 break;
             }
         }

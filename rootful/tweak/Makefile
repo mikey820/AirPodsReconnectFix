@@ -11,7 +11,8 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = AirPodsReconnectFix
 AirPodsReconnectFix_FILES = ../../Tweak.x
 AirPodsReconnectFix_CFLAGS = -fobjc-arc
-# MPAVRoutingController lives in MediaPlayer; link it so the class is present.
-AirPodsReconnectFix_FRAMEWORKS = MediaPlayer
+# MediaPlayer: MPAudioDeviceController (route enum/pick) + MPVolumeView (route
+# discovery). UIKit: the hidden offscreen UIWindow that hosts the MPVolumeView.
+AirPodsReconnectFix_FRAMEWORKS = MediaPlayer UIKit
 
 include $(THEOS_MAKE_PATH)/tweak.mk
