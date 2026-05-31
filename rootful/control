@@ -1,8 +1,8 @@
 Package: com.mikey820.airpodsreconnectfix
 Name: AirPodsReconnectFix
-Version: 2.7.8
+Version: 2.8.6
 Architecture: iphoneos-arm
-Description: iOS 6 AirPods fix (post-AirPods-Pro-3 firmware): pre-emptive service re-assert every 18s to head off the ~45s firmware disconnect, plus burst-reconnect fallback
+Description: iOS 6 AirPods fix (post-AirPods-Pro-3 firmware): pre-emptive service re-assert every 18s to head off the ~45s firmware disconnect (plus burst-reconnect fallback), AND a gapless silent A2DP keep-warm stream so pausing/skipping tracks and system sounds keep routing to the AirPods (mechanism from asentientbot's ios-6-pods-hack, folded in)
 Maintainer: mikey820 <mikey820@users.noreply.github.com>
 Author: mikey820
 Section: Tweaks

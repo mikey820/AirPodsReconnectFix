@@ -11,7 +11,8 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = AirPodsReconnectFix
 AirPodsReconnectFix_FILES = ../../Tweak.x
 AirPodsReconnectFix_CFLAGS = -fobjc-arc
-# MPAVRoutingController lives in MediaPlayer; link it so the class is present.
-AirPodsReconnectFix_FRAMEWORKS = MediaPlayer
+# MediaPlayer: MPAudioDeviceController (legacy manual-bounce path, dormant).
+# AVFoundation: AVAudioSession/AVAudioPlayer for the silent A2DP keep-warm stream.
+AirPodsReconnectFix_FRAMEWORKS = MediaPlayer AVFoundation
 
 include $(THEOS_MAKE_PATH)/tweak.mk

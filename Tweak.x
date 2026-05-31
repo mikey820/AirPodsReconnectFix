@@ -1,7 +1,9 @@
 #import <Foundation/Foundation.h>
+#import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 #import <sys/stat.h>
 #import <dlfcn.h>
+#import "silence.h"
 
 // AirPodsReconnectFix  (iOS 6 / armv7)
 //
@@ -178,7 +180,7 @@ static void rememberPlaybackStateOnDrop(NSString *why) {
     @try {
         Class C = objc_getClass("SBMediaController");
         if (!C) { AFLog(@"[resume] SBMediaController missing (%@)", why); return; }
-        id mc = [C sharedInstance];
+        SBMediaController *mc = (SBMediaController *)[C sharedInstance];
         BOOL playing = [mc respondsToSelector:@selector(isPlaying)] && [mc isPlaying];
         gWasPlayingAtLastDrop = playing;
         gLastDropAt = [NSDate date];
@@ -203,7 +205,7 @@ static void tryResumePlayback(NSString *why) {
         }
         Class C = objc_getClass("SBMediaController");
         if (!C) { AFLog(@"[resume] SBMediaController missing (%@)", why); return; }
-        id mc = [C sharedInstance];
+        SBMediaController *mc = (SBMediaController *)[C sharedInstance];
         if (![mc respondsToSelector:@selector(play)]) {
             AFLog(@"[resume] no -play selector"); return;
         }
@@ -621,6 +623,91 @@ static void dumpClassMethods(Class cls, const char *why) {
     }
 }
 
+// ---- A2DP keep-warm stream (the skip/pause + system-sound fix) -------------
+// Ported from asentientbot/ios-6-pods-hack, which the bounty owner confirmed
+// fixes the pause/skip audio-routing bug when run alongside this tweak's
+// disconnect fix. The mechanism: keep a continuous, GAPLESS, inaudible audio
+// stream alive so the A2DP route to the AirPods never goes idle. On iOS 6, when
+// the media stream stops or has a gap (pause, the brief silence when skipping a
+// track, or between short system sounds), the A2DP link suspends and the stack
+// fails to re-point the next sound back to the AirPods — it plays on the speaker
+// while the AirPods stay connected. A constantly-running silent stream prevents
+// the route from ever going idle, so audio stays on the AirPods across the gap.
+//
+// Two details are what make this work where earlier in-house attempts failed:
+//   1. A real ~60s silent MP3 (not a synthesized zero-PCM WAV), decoded by
+//      AVAudioPlayer exactly as the proven hack does.
+//   2. OVERLAPPING players: a fresh player is started every kWarmRefreshSec
+//      (< the clip length) while the previous one is still playing, so there is
+//      never a gap at a loop boundary. We keep the last few players alive and
+//      drop the oldest. (A single numberOfLoops=-1 player left micro-gaps.)
+//
+// Session = Playback + MixWithOthers so the silence layers UNDER real music and
+// never interrupts or ducks it. Anchored to the AirPods connect/disconnect, like
+// the disconnect fix: warm on connect, stop on disconnect.
+static const NSTimeInterval kWarmRefreshSec = 50.0;  // < 60s clip => always overlap
+
+@interface APRFWarm : NSObject
+@property(nonatomic, strong) NSData *data;
+@property(nonatomic, strong) NSMutableArray *players;  // overlapping AVAudioPlayers
+@property(nonatomic, strong) NSTimer *timer;
+@property(nonatomic, assign) BOOL active;
+@end
+
+@implementation APRFWarm
+- (instancetype)init {
+    if ((self = [super init])) {
+        @try {
+            AVAudioSession *s = [AVAudioSession sharedInstance];
+            [s setCategory:AVAudioSessionCategoryPlayback
+               withOptions:AVAudioSessionCategoryOptionMixWithOthers error:nil];
+        } @catch (NSException *e) { AFLog(@"[warm][EXC session] %@ %@", e.name, e.reason); }
+        // Static embedded MP3 — no copy, never freed (it's a global array).
+        _data = [NSData dataWithBytesNoCopy:silence_mp3 length:silence_mp3_len freeWhenDone:NO];
+        _players = [NSMutableArray array];
+        // Repeating timer; -refresh no-ops while inactive. start/stop fire it
+        // immediately so a player begins the instant the AirPods connect.
+        _timer = [NSTimer scheduledTimerWithTimeInterval:kWarmRefreshSec
+                                                  target:self
+                                                selector:@selector(refresh)
+                                                userInfo:nil
+                                                 repeats:YES];
+    }
+    return self;
+}
+- (void)refresh {
+    @try {
+        if (!self.active) { [self.players removeAllObjects]; return; }
+        NSError *e = nil;
+        AVAudioPlayer *p = [[AVAudioPlayer alloc] initWithData:self.data error:&e];
+        if (!p) { AFLog(@"[warm] player init failed: %@", e); return; }
+        if (![p play]) AFLog(@"[warm] -play returned NO");
+        [self.players addObject:p];
+        // Keep a small overlap window; dropping the strong ref stops/frees the
+        // oldest (already-finished) player.
+        if (self.players.count > 2) [self.players removeObjectAtIndex:0];
+    } @catch (NSException *ex) { AFLog(@"[warm][EXC refresh] %@ %@", ex.name, ex.reason); }
+}
+- (void)setActive:(BOOL)on why:(NSString *)why {
+    if (_active == on) return;
+    _active = on;
+    AFLog(@"[warm] %@ (%@)", on ? @"ON" : @"OFF", why);
+    [self refresh];  // start the first player / tear down immediately
+}
+@end
+
+static APRFWarm *gWarm;
+static void warmStart(NSString *why) {
+    @try {
+        if (!gWarm) gWarm = [[APRFWarm alloc] init];
+        [gWarm setActive:YES why:why];
+    } @catch (NSException *e) { AFLog(@"[warm][EXC start] %@ %@", e.name, e.reason); }
+}
+static void warmStop(NSString *why) {
+    @try { if (gWarm) [gWarm setActive:NO why:why]; }
+    @catch (NSException *e) { AFLog(@"[warm][EXC stop] %@ %@", e.name, e.reason); }
+}
+
 static void setupSpringBoard(void) {
     AFLog(@"[SpringBoard] installing BluetoothManager observers (autoReconnect=%s)",
           kAutoReconnectEnabled ? "YES" : "NO");
@@ -709,7 +796,7 @@ static void setupSpringBoard(void) {
     // a generous set so we capture whatever this iOS build actually fires.
     observe(@"BluetoothDeviceDisconnectSuccessNotification", @"disconnect", ^(NSNotification *n) {
         BluetoothDevice *d = (BluetoothDevice *)n.object;
-        if (deviceLooksLikeAirPods(d)) stopPreempt(@"AirPods disconnect");
+        if (deviceLooksLikeAirPods(d)) { stopPreempt(@"AirPods disconnect"); warmStop(@"AirPods disconnect"); }
         handleDisconnect(d, n.userInfo);
     });
     observe(@"BluetoothDeviceConnectSuccessNotification", @"connect", ^(NSNotification *n) {
@@ -717,6 +804,9 @@ static void setupSpringBoard(void) {
         // Pre-emption experiment: re-assert the service connection a few seconds
         // before the firmware's ~45s teardown, anchored to this connect.
         startPreempt(@"AirPods connect");
+        // Keep the A2DP route warm so pauses/skips/system-sounds stay on the
+        // AirPods (no-ops if already running).
+        warmStart(@"AirPods connect");
         if (kBounceOnConnect) {
             scheduleRouteReset(@"post-connect");
         }
@@ -754,6 +844,7 @@ static void setupSpringBoard(void) {
         for (BluetoothDevice *d in [m connectedDevices]) {
             if (deviceLooksLikeAirPods(d)) {
                 startPreempt(@"already-connected at startup");
+                warmStart(@"already-connected at startup");
                 break;
             }
         }

@@ -1,56 +1,79 @@
-# ts does not work yet
+# AirPodsReconnectFix (iOS 6)
 
-# AirPodsReconnectFix  (iOS 6)
+Fixes **AirPods on iOS 6** after the post–AirPods-Pro-3 firmware update, on two
+fronts that the new firmware broke:
 
-A diagnostic + mitigation tweak for the **AirPods Bluetooth disconnect/reconnect
-loop on iOS 6**. The AirPods Pro 2/3 pair to an iOS 6 device as a generic
-A2DP/HFP stereo headset via Settings (iOS 6 has none of the W1/AAP machinery —
-to it they're just a Bluetooth headset). They pair fine and audio is great while
-it holds, but after the post-AirPods-Pro-3 firmware update the link drops and
-re-establishes every few seconds.
+1. **The disconnect/reconnect loop** — the link drops and re-establishes every
+   ~45 seconds.
+2. **The pause/skip audio-routing bug** — when you pause, skip a track, or play a
+   short system sound, audio stops routing to the AirPods (it falls back to the
+   speaker/receiver) even though the AirPods stay connected, until you manually
+   flip the output in the route picker.
 
-## Honest scope
+The AirPods Pro 2/3 pair to an iOS 6 device as a generic A2DP/HFP stereo headset
+(iOS 6 has none of the W1/AAP machinery — to it they're just a Bluetooth
+headset). They pair fine and sound great while everything holds; the two bugs
+above are what the newer firmware introduced.
 
-The likely cause is that the newer AirPods firmware changed something at the
-Bluetooth link layer (connection parameters / supervision timeout / link policy)
-that the ancient iOS 6 stack mishandles, tearing the link down. That layer lives
-in `bluetoothd` and **cannot be safely rewritten blind from a tweak** (crashing
-`bluetoothd` in a loop kills Bluetooth system-wide). So this is **not yet a
-guaranteed fix** — it is the data-gathering + symptom-mitigation step that makes
-a real fix possible.
+## How it works
 
-It does two things, in two processes:
+Everything runs in **SpringBoard** via the private but stable
+`BluetoothManager` framework. No daemon patching, no system files touched.
 
-| Process | Behaviour |
-|---|---|
-| `bluetoothd` | **Read-only.** On load, dumps every Bluetooth/audio Obj-C class (and key method lists) so the next version can target the real connection-management code precisely. No hooks — cannot crash the daemon. |
-| `SpringBoard` | Uses `BluetoothManager` (private framework, present on iOS 6) to log every connect / disconnect / connect-fail (with `userInfo`), and **attempts the mitigation**: when the AirPods drop unexpectedly it re-issues `-connect` immediately. Debounced (1.5 s) and rate-capped (max 4 attempts / 60 s) so it can never become its own loop. |
+### 1. Disconnect fix — pre-emptive service re-assert
 
-## Pulling the logs — no Mac needed
+The drop is a dead-regular ~45 s timer the new firmware enforces; mere link
+*activity* (battery polls, a silent audio stream) does **not** reset it. What
+does: every **18 s** while the AirPods are connected, the tweak re-runs the
+host-side service-connect handshake (`-connectWithServices:` on the live
+device). That lands before the firmware's teardown deadline and keeps resetting
+it, so the link stays up. A **burst-reconnect** fallback (a tight sequence of
+`-connect` attempts, debounced and rate-capped) catches any drop that still
+slips through and brings the AirPods back in ~2 s, optionally resuming whatever
+was playing.
+
+### 2. Pause/skip routing fix — gapless A2DP keep-warm
+
+On iOS 6 the A2DP route goes idle the instant the media stream stops or gaps
+(pause, the brief silence when skipping a track, or between short system
+sounds), and the stack then fails to re-point the next sound back to the
+AirPods. The fix is to never let the route go idle: the tweak plays a
+continuous, **inaudible** stream so A2DP stays active across those gaps and audio
+keeps flowing to the AirPods.
+
+Two details make it reliable:
+
+- A real ~60 s **silent MP3** decoded by `AVAudioPlayer` (embedded in the dylib;
+  nothing to download or bundle separately).
+- **Overlapping players** — a fresh player starts every 50 s while the previous
+  60 s clip is still playing, so there is never a gap at a loop boundary.
+
+The session category is `Playback` + `MixWithOthers`, so the silence layers
+*under* real music and never interrupts, ducks, or pauses it. The stream starts
+when the AirPods connect and stops when they disconnect.
+
+This mechanism is folded in from **[asentientbot/ios-6-pods-hack](https://github.com/asentientbot/ios-6-pods-hack)**
+(silent MP3 courtesy of [anars/blank-audio](https://github.com/anars/blank-audio)) —
+you no longer need that tweak installed separately; both fixes ship in this one
+package.
+
+## Logs — no Mac needed
 
 `os_log` doesn't exist on iOS 6, so everything is written to a plain text file:
 
 ```
-/var/mobile/Documents/AirPodsReconnectFix.log
+/var/mobile/AirPodsReconnectFix.log
 ```
 
-Open it in **Filza** (or any file manager). Trigger the disconnect loop, then
-read/send the file — the `[bluetoothd][class]` / `[bluetoothd][method]` lines and
-the `[SpringBoard][disconnect] ... userInfo=` lines are what we need to write the
-real low-level fix.
-
-## Tuning
-
-In `Tweak.x`:
-
-- `kAutoReconnectEnabled` — set `NO` for a logging-only build (no state changes).
-- `kReconnectDelaySec`, `kMaxAttempts`, `kWindowSec` — mitigation rate limits.
+Open it in **Filza** (or any file manager). Useful markers:
+`[SpringBoard][preempt] RE-ASSERT` (disconnect fix firing), `[warm] ON/OFF`
+(keep-warm engine following the AirPods connection), and
+`[SpringBoard][disconnect] … userInfo=` (a drop the firmware forced).
 
 ## Build
 
-iOS 6 is 32-bit (`armv7`/`armv7s`), rootful, deployment target 6.0. CI
-(`.github/workflows/build.yml`) runs on an older macOS image, pulls an
-armv7-capable iPhoneOS SDK (≤ 10.x) into Theos, builds with
-`-miphoneos-version-min=6.0`, and attaches the `iphoneos-arm` `.deb` to the
-GitHub Release on any `v*` tag. Locally: `make clean all` with `$THEOS` set and
-an old SDK in `$THEOS/sdks`.
+iOS 6 is 32-bit (`armv7`), rootful, deployment target 6.0. CI
+(`.github/workflows/build.yml`) runs on **Linux** (its linker still supports
+armv7), pulls an armv7-capable iPhoneOS SDK (≤ 10.x) into Theos, and attaches the
+`iphoneos-arm` `.deb` to the GitHub Release on any `v*` tag. Locally:
+`make clean all` with `$THEOS` set and an old SDK in `$THEOS/sdks`.
