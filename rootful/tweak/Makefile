@@ -1,10 +1,10 @@
 ARCHS = armv7
 TARGET = iphone:clang:latest:6.0
 
-# SpringBoard only — the fix is audio-route bouncing via MediaPlayer's
-# MPAVRoutingController, all reachable here. (We abandoned BTServer injection:
-# dyld strips DYLD_INSERT on that restricted daemon.)
-INSTALL_TARGET_PROCESSES = SpringBoard
+# SpringBoard: the disconnect fix (pre-emptive re-assert). Music: the route-heal
+# (re-pick the AirPods output) — must run in the audio-owning process because
+# SpringBoard's MPAudioDeviceController is blind (nRoutes=1, confirmed on-device).
+INSTALL_TARGET_PROCESSES = SpringBoard Music
 
 include $(THEOS)/makefiles/common.mk
 

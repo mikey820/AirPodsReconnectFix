@@ -411,9 +411,9 @@ static void healRoute(NSString *why) {
     } @catch (NSException *e) { AFLog(@"[heal][EXC] %@ %@", e.name, e.reason); }
 }
 
-// Heal loop. Anchored to the AirPods connection and generation-gated exactly
-// like the pre-empt loop: startHeal bumps the gen; each tick reschedules only
-// while its gen is current; a disconnect (stopHeal) orphans the pending tick.
+// Heal loop. Runs in the media app for the life of the process; generation-gated
+// (startHeal bumps the gen; each tick reschedules only while its gen is current)
+// so calling startHeal twice can't spawn two loops, and stopHeal can orphan it.
 // Every tick: keep discovery alive, log the picker's view, and heal if drifted.
 static int gHealGen = 0;
 static const double kHealTickSec = 2.5;   // re-pick within ~2.5s of a skip/pause
@@ -823,7 +823,7 @@ static void setupSpringBoard(void) {
     // a generous set so we capture whatever this iOS build actually fires.
     observe(@"BluetoothDeviceDisconnectSuccessNotification", @"disconnect", ^(NSNotification *n) {
         BluetoothDevice *d = (BluetoothDevice *)n.object;
-        if (deviceLooksLikeAirPods(d)) { stopPreempt(@"AirPods disconnect"); stopHeal(@"AirPods disconnect"); }
+        if (deviceLooksLikeAirPods(d)) stopPreempt(@"AirPods disconnect");
         handleDisconnect(d, n.userInfo);
     });
     observe(@"BluetoothDeviceConnectSuccessNotification", @"connect", ^(NSNotification *n) {
@@ -831,9 +831,6 @@ static void setupSpringBoard(void) {
         // Pre-emption experiment: re-assert the service connection a few seconds
         // before the firmware's ~45s teardown, anchored to this connect.
         startPreempt(@"AirPods connect");
-        // Auto route-heal: re-pick the AirPods output whenever audio drifts off
-        // them after a skip/pause/system-sound gap. Safe (only ever picks AirPods).
-        startHeal(@"AirPods connect");
         if (kBounceOnConnect) {
             scheduleRouteReset(@"post-connect");
         }
@@ -871,7 +868,6 @@ static void setupSpringBoard(void) {
         for (BluetoothDevice *d in [m connectedDevices]) {
             if (deviceLooksLikeAirPods(d)) {
                 startPreempt(@"already-connected at startup");
-                startHeal(@"already-connected at startup");
                 break;
             }
         }
@@ -948,9 +944,22 @@ static void dumpBluetoothdRuntime(void) {
             if ([proc isEqualToString:@"SpringBoard"]) {
                 setupSpringBoard();
             } else {
-                // Any non-SpringBoard process we were injected into is a BT
-                // daemon (per the filter) — dump its runtime.
-                dumpBluetoothdRuntime();
+                // Injected into the media app (per the filter — com.apple.mobileipod
+                // / Music). SpringBoard's MPAudioDeviceController is blind
+                // (nRoutes=1, confirmed), but the process that actually OWNS the
+                // audio session has live AirPlay route discovery — so the AirPods
+                // should enumerate as a pickable indexed route here. Run the heal
+                // loop in-process: log what the picker sees, and re-pick the
+                // AirPods route if media audio has drifted off them after a
+                // skip/pause (only ever picks AirPods — never the speaker).
+                AFLog(@"[media] route-heal scheduled in %@", proc);
+                // Defer past launch so UIApplication exists before we mount the
+                // route-discovery window (creating a UIWindow at %ctor is too early).
+                NSString *p = proc;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    startHeal([NSString stringWithFormat:@"media app %@", p]);
+                });
             }
         } @catch (NSException *e) {
             // Critically, never crash the BT daemon or SpringBoard at load.

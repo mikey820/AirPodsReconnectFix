@@ -1,8 +1,8 @@
 Package: com.mikey820.airpodsreconnectfix
 Name: AirPodsReconnectFix
-Version: 2.8.4
+Version: 2.8.5
 Architecture: iphoneos-arm
-Description: iOS 6 AirPods fix: pre-emptive service re-assert beats the ~45s firmware disconnect, PLUS an auto route-heal that re-picks the AirPods output (via a hidden MPVolumeView + MPAudioDeviceController) whenever audio drifts off them after a skip/pause/system-sound gap — never the speaker, so it can't strand audio
+Description: iOS 6 AirPods fix: pre-emptive service re-assert beats the ~45s firmware disconnect (SpringBoard), PLUS an in-app route-heal injected into the Music app that re-picks the AirPods output whenever media audio drifts off them after a skip/pause — never the speaker, so it can't strand audio
 Maintainer: mikey820 <mikey820@users.noreply.github.com>
 Author: mikey820
 Section: Tweaks
