@@ -1,5 +1,7 @@
 # AirPodsReconnectFix (iOS 6)
 
+Add my repo for an easy install! https://mikey820.github.io/repo/
+
 Fixes **AirPods on iOS 6** after the post–AirPods-Pro-3 firmware update, on two
 fronts that the new firmware broke:
 
