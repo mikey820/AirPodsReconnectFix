@@ -17,6 +17,22 @@ The AirPods Pro 2/3 pair to an iOS 6 device as a generic A2DP/HFP stereo headset
 headset). They pair fine and sound great while everything holds; the two bugs
 above are what the newer firmware introduced.
 
+## ❤️ Support the Project
+
+If you find this project useful and would like to support development, donations are appreciated.
+
+### Base (Recommended)
+**Network:** Base  
+**Address:** `0x3a938bebeaFEbE057F13e4B14d250CBdcEb68B43`
+
+Supports:
+- ETH (Base)
+- USDC (Base)
+
+Please double-check that you're sending on the **Base** network.
+
+Thank you for your support! 🚀
+
 ## How it works
 
 Everything runs in **SpringBoard** via the private but stable
