@@ -66,11 +66,6 @@ The session category is `Playback` + `MixWithOthers`, so the silence layers
 *under* real music and never interrupts, ducks, or pauses it. The stream starts
 when the AirPods connect and stops when they disconnect.
 
-This mechanism is folded in from **[asentientbot/ios-6-pods-hack](https://github.com/asentientbot/ios-6-pods-hack)**
-(silent MP3 courtesy of [anars/blank-audio](https://github.com/anars/blank-audio)) —
-you no longer need that tweak installed separately; both fixes ship in this one
-package.
-
 ## Logs — no Mac needed
 
 `os_log` doesn't exist on iOS 6, so everything is written to a plain text file:
